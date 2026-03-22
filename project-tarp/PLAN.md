@@ -44,6 +44,14 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 **Status:** Tested on 20 bills → 432 chunks. Needs to be run on the full 7,789-bill dataset.
 
 **Key implementation details:**
+- Deduplication happens before embedding and is part of the chunking pipeline, not a later storage concern.
+- **Phase 1 — exact full-document dedup:** normalize each fetched bill's full text (strip markup, collapse whitespace, lowercase for hashing only), compute a `document_text_hash`, and collapse bills with byte-for-byte equivalent normalized text into one canonical document record.
+- Preserve bill identity even when text is deduplicated: each canonical document keeps an alias list containing every linked `bill_id`, `version`, `status`, `congress`, `type`, and `number` that resolved to that same text.
+- Canonical document selection should be deterministic. Prefer the alias with the "best" version in this order: `enr` > `eas`/`eah` > `es`/`eh` > `rs`/`rh` > `ih`/`is`; break remaining ties by `bill_id`.
+- Chunk only the canonical document text. Do not emit duplicate chunk rows for alias bills whose full text is identical.
+- **Phase 2 — exact section-level dedup:** after parsing a canonical document into sections, normalize each section body separately and compute a `section_text_hash`. If the same section text appears multiple times across canonical documents, embed it once and attach multiple section aliases to it.
+- Section-level dedup must hash the substantive section body, not the bill-specific context prefix. The current prefix format includes bill identifiers, so hashing the final chunk text would miss duplicates across companion bills and status aliases.
+- Keep legally meaningful differences. Dedup only exact normalized matches; do not merge near-duplicates or fuzzy companion bills at this stage.
 - Two parsing paths: XML bills (majority, uses `<section>` tag traversal) and HTML/text bills (fallback, regex-based `SECTION`/`SEC.` splitting).
 - Extracts metadata from both the XML structure (Dublin Core, `<form>` element) and the fetcher's `.meta.json` sidecar files.
 - Context prefix format: `"[H.R. 1424, 110th Congress] Section 101: Purchases of Troubled Assets — {text}"`.
@@ -52,8 +60,40 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Sections exceeding `--max-tokens` (default 512) are split at `<subsection>` boundaries first, then force-split with `--overlap` (default 64) token overlap at sentence boundaries.
 - Per-bill chunk cap (`--max-chunks-per-bill`, default 200) keeps the meatiest chunks and drops the rest.
 - Filters out chunks below 30 tokens.
-- Outputs `./data/processed_chunks.json` with full metadata per chunk.
+- Outputs rolling JSONL shards under `./data/processed_chunks/{congress}/` rather than one monolithic JSON file. Each line is one canonical chunk record with dedup metadata. Each chunk should carry at minimum: `document_text_hash`, `section_text_hash` (when applicable), `canonical_bill_id`, and alias metadata describing which bills/sections map to that text.
+- Sharding is by canonical bill count with a soft chunk cap, not by bill type. This avoids giant `hr`/`s` shards while keeping all chunks for a canonical bill together.
+- Default shard policy: rotate after 500 canonical bills or 40,000 chunks, but only flush between canonical bills.
+- Each congress directory also gets a `manifest.json` with shard counts, chunk counts, and dedup summary stats.
 - Reports estimated embedding cost at the end of the run.
+
+**Deduplication data model:**
+- `canonical_bill_id`: stable bill identifier chosen to represent an exact full-text-equivalent bill family.
+- `document_text_hash`: normalized full-document hash used for Phase 1 exact dedup.
+- `section_text_hash`: normalized section-body hash used for Phase 2 exact dedup across canonical documents.
+- `document_aliases`: list of all bill/status/version records that share the canonical document text.
+- `section_aliases`: list of all canonical bill sections that share the exact same normalized section body.
+- `manifest.json`: congress-level summary of shard layout plus dedup and chunk counts.
+
+**Pipeline placement:**
+1. Fetch one best-available text per bill with `fetcher.py`.
+2. Normalize full text and collapse exact duplicate documents into canonical records.
+3. Parse only canonical documents into sections.
+4. Normalize section bodies and collapse exact duplicate sections across canonical documents.
+5. Build chunks from canonical section bodies, then add display-time prefixes and alias metadata.
+6. Write deduplicated canonical chunks into rolling JSONL shards and a congress manifest.
+7. Pass the shard directory to the embedder.
+
+**Expected effect:**
+- Removes waste from bills that were reintroduced or progressed through statuses without textual change.
+- Reduces repeated sections shared across companion bills or unchanged later versions.
+- Keeps retrieval quality intact because aliases are preserved for display, filtering, and downstream reranking.
+
+**Implementation notes / alternative decisions:**
+- Full-document dedup hashes normalized extracted text from the fetched file. An alternative would be hashing parsed section text only, which would ignore front matter differences but could accidentally merge documents that differ outside the parsed section set.
+- Section-level dedup hashes the section body only, excluding bill-specific prefixes and section numbering. An alternative would include headers or enum labels in the hash, which is safer but would miss duplicates where only numbering changed.
+- Canonical chunks currently use the highest-priority alias's bill prefix for embedding text and keep all other bill/status mappings in `document_aliases` and `section_aliases`. An alternative would be to embed a neutralized prefix-free body and add bill context only at retrieval time.
+- Dedup remains exact-match only. A future alternative is near-duplicate clustering for companion bills, but that should be treated as a retrieval/display optimization rather than a hard drop from the embedding corpus.
+- Shards are based on canonical bill count plus a soft chunk ceiling. An alternative is fixed-size chunk-only sharding, which balances file sizes more tightly but makes it easier to split one bill across shards.
 
 ### Step 3: The Embedder ✅ CODE COMPLETE (not yet run)
 **Goal:** Convert text chunks into 1536-dimensional vector arrays via OpenAI API.
@@ -61,8 +101,8 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 **Status:** Code complete. Waiting on the full chunker output before running (to avoid paying for a partial dataset).
 
 **Key implementation details:**
-- Reads `./data/processed_chunks.json`, sends batches of 500 texts to `openai.embeddings.create()`.
-- Incremental: if `./data/embedded_chunks.json` already exists, only embeds chunks not already in the checkpoint (keyed by `bill_id` + `section_enum` + `chunk_index`).
+- Reads `./data/processed_chunks/` recursively, loading all `shard-*.jsonl` files, then sends batches of 500 texts to `openai.embeddings.create()`.
+- Incremental: if `./data/embedded_chunks.json` already exists, only embeds chunks not already in the checkpoint. After dedup lands, checkpoint identity should be based on canonical chunk identity (`document_text_hash` + `section_text_hash` + `chunk_index`) rather than raw `bill_id` alone.
 - Checkpoint saves after each batch on error, so a failed run can resume without re-paying.
 - `--dry-run` flag shows cost estimate without calling the API.
 - Output format: `{"model": "...", "dimensions": 1536, "count": N, "chunks": [...]}` where each chunk has an `"embedding"` field containing the 1536-float vector.

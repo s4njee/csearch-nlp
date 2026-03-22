@@ -39,7 +39,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-INPUT_FILE = DATA_DIR / "processed_chunks.json"
+INPUT_FILE = DATA_DIR / "processed_chunks"
 OUTPUT_FILE = DATA_DIR / "embedded_chunks.json"
 
 DEFAULT_MODEL = "text-embedding-3-small"
@@ -75,6 +75,44 @@ def embed_batch(client: OpenAI, texts: list[str], model: str, dimensions: int) -
     return [item.embedding for item in response.data]
 
 
+def load_chunk_list(path: Path) -> list[dict]:
+    """Load chunks from a JSON file, checkpoint wrapper, or JSONL shard directory."""
+    if path.is_dir():
+        chunks = []
+        for shard_path in sorted(path.rglob("shard-*.jsonl")):
+            with shard_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        chunks.append(json.loads(line))
+        return chunks
+
+    data = json.loads(path.read_text())
+    if isinstance(data, dict):
+        chunks = data.get("chunks", [])
+        if isinstance(chunks, list):
+            return chunks
+        return []
+    return data if isinstance(data, list) else []
+
+
+def chunk_identity(chunk: dict) -> tuple[str, str, int]:
+    """Stable identity for incremental embedding after dedup."""
+    document_hash = chunk.get("document_text_hash")
+    section_hash = chunk.get("section_text_hash")
+    if document_hash or section_hash:
+        return (
+            document_hash or "",
+            section_hash or "",
+            int(chunk.get("chunk_index", 0)),
+        )
+    return (
+        chunk.get("bill_id", ""),
+        chunk.get("section_enum", ""),
+        int(chunk.get("chunk_index", 0)),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed text chunks via OpenAI API")
     parser.add_argument("--input", type=str, default=str(INPUT_FILE),
@@ -97,18 +135,17 @@ def main():
     # Load chunks
     if not input_path.exists():
         log.error(f"Input file not found: {input_path}")
-        log.error("Run chunker.py first to generate processed_chunks.json")
+        log.error("Run chunker.py first to generate processed chunk shards")
         return
-    chunks = json.loads(input_path.read_text())
-    log.info(f"Loaded {len(chunks)} chunks from {input_path.name}")
+    chunks = load_chunk_list(input_path)
+    log.info(f"Loaded {len(chunks)} chunks from {input_path}")
 
     # Load existing checkpoint for incremental embedding
     existing = {}
     if output_path.exists():
-        existing_chunks = json.loads(output_path.read_text())
-        # Index by (bill_id, section_enum, chunk_index) to detect already-embedded
+        existing_chunks = load_chunk_list(output_path)
         for ec in existing_chunks:
-            key = (ec["bill_id"], ec.get("section_enum", ""), ec.get("chunk_index", 0))
+            key = chunk_identity(ec)
             if "embedding" in ec:
                 existing[key] = ec
         log.info(f"Found {len(existing)} already-embedded chunks in checkpoint")
@@ -117,7 +154,7 @@ def main():
     to_embed = []
     already_done = []
     for c in chunks:
-        key = (c["bill_id"], c.get("section_enum", ""), c.get("chunk_index", 0))
+        key = chunk_identity(c)
         if key in existing:
             already_done.append(existing[key])
         else:
