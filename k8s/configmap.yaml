@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: csearch-nlp-config
+  namespace: csearch-nlp
+data:
+  QDRANT_HOST: "qdrant.csearch-nlp.svc.cluster.local"
+  QDRANT_PORT: "6333"
+  QDRANT_COLLECTION: "bill_chunks"
+  EMBEDDING_MODEL: "nomic-embed-text"
+  LLM_MODEL: "qwen2.5:7b"
+  RAG_VECTOR_TOP_K: "40"
+  RAG_RERANK_TOP_K: "10"
+  RAG_SCORE_THRESHOLD: "0.35"
+  RRF_K: "60"
+  REDIS_URL: "redis://redis-service.default.svc.cluster.local:6379/1"
+  CACHE_EMBEDDING_TTL: "86400"
+  CACHE_SEARCH_TTL: "3600"
+  CACHE_LLM_TTL: "3600"
+  FULLTEXT_CACHE_DIR: "/data/fulltext"
+  GOVINFO_RATE_LIMIT: "10"

@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: csearch-nlp-sync
+  namespace: csearch-nlp
+spec:
+  schedule: "30 0 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            node: worker1
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          containers:
+            - name: nlp-sync
+              image: 10.0.0.3:30252/csearch-nlp:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "csearch_nlp.pipeline", "sync"]
+              envFrom:
+                - configMapRef:
+                    name: csearch-nlp-config
+              env:
+                - name: PG_CONNECTION_STRING
+                  valueFrom:
+                    secretKeyRef:
+                      name: csearch-nlp-secrets
+                      key: pg-connection-string
+                - name: EMBEDDING_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: csearch-nlp-secrets
+                      key: embedding-api-key
+              volumeMounts:
+                - name: fulltext-cache
+                  mountPath: /data/fulltext
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "250m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "500m"
+          volumes:
+            - name: fulltext-cache
+              persistentVolumeClaim:
+                claimName: nlp-fulltext-pvc
+          restartPolicy: OnFailure
