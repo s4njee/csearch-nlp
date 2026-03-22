@@ -1,6 +1,6 @@
 # CSearch NLP — Natural Language Bill Search
 
-A standalone RAG service for semantic search over U.S. Congressional legislation, designed to run entirely locally using an RTX 3090, Qdrant, and Ollama.
+A standalone RAG service for semantic search over U.S. Congressional legislation. Embeddings are generated via OpenAI's `text-embedding-3-small` and stored in Qdrant. Answer generation uses `gpt-5.4-nano`. The service runs on a local K8s cluster (`mars`) with hostPath SSD storage.
 
 ## Problem Statement
 
@@ -46,9 +46,9 @@ This is a **standalone project** with read-only access to the central CSearch Po
            │                  │                  │
            ▼                  ▼                  ▼
     ┌────────────┐    ┌──────────────┐   ┌──────────────┐
-    │ PostgreSQL │    │   Qdrant     │   │Ollama (seed) │
-    │ (existing, │    │ (on-disk     │   │OpenAI (live) │
-    │ read-only) │    │ HNSW mode)   │   │              │
+    │ PostgreSQL │    │   Qdrant     │   │   OpenAI     │
+    │ (existing, │    │ (on-disk     │   │  embed +     │
+    │ read-only) │    │ HNSW mode)   │   │  generate    │
     └────────────┘    └──────────────┘   └──────────────┘
            │
      read-only
@@ -69,10 +69,10 @@ Embedding 50 years of raw Congressional `.xml` creates an unmanageable ~55M cont
 - Incorporating JSON Vote records allows mapping semantic clusters of historical "Yea/Nay" dynamics.
 - *Outcome:* The graph is reduced 7x to roughly **~10M chunks**.
 
-### 2. Hybrid Inference Pipeline (Ollama + OpenAI)
-To balance massive ingestion volumes with production latency and quality requirements, we split inference between local and cloud providers:
-- **Vector DB Seeding (Ollama)**: Because we use hardware equipped with high VRAM (RTX 3090, 24GB VRAM), we utilize dense local embedders (`nomic-embed-text` or `mxbai-embed-large`) via Ollama. This eliminates usage limits and external API costs when bulk-loading and embedding millions of document chunks into the Qdrant DB.
-- **Production API Hits (OpenAI)**: When a user performs a search, the live query embedding and final synthesized LLM answer generation are routed through the OpenAI API. This ensures low-latency, highly accurate responses for the actual user-facing application without bogging down the local GPU.
+### 2. OpenAI Inference Pipeline
+All inference is routed through OpenAI for consistency between dev and prod environments:
+- **Embeddings** (`text-embedding-3-small`, 1536 dims): Used for both batch ingestion and live query embedding. This ensures structural compatibility between the dev Qdrant collection and any future production deployment — no re-embedding required when migrating. Estimated batch cost for the full 50-year corpus is ~$32; single-year test runs (e.g., 110th Congress / 2008) cost ~$1.
+- **Answer Generation** (`gpt-5.4-nano`): The cheapest and fastest model in the GPT-5.4 family ($0.20/1M input tokens). Used to synthesize a final user-facing answer from the top retrieved bill chunks. Quality is excellent for structured summarization tasks.
 
 ### 3. Vector Datastore (Qdrant)
 We utilize Qdrant in **Memory-Mapped (HostPath) Mode** to maintain tight RAM footprints.
@@ -101,15 +101,19 @@ This plan is organized into big conceptual steps. Each step is a meaningful mile
 
 Before writing any application code, nail down the decisions that everything else depends on.
 
-**What this covers:**
-- Finalize the embedding model. The current README references Ollama for batch seeding and OpenAI for live queries, but `NLP.md` specifies `text-embedding-3-small` (OpenAI, 1536 dims) for everything in production and Ollama only for local dev. These need to agree, because the Qdrant collection's vector dimensions are locked at creation time. If we go with Ollama's `nomic-embed-text` (768 dims) for dev and OpenAI (1536 dims) for prod, the collections are incompatible — we'd need to re-embed when migrating.
-- Finalize the LLM provider. `NLP.md` specifies Claude Sonnet for answer generation; the README references OpenAI generically; `IMPLEMENTATION.md` configmap uses `qwen2.5:7b` via Ollama. Pick one for dev and one for prod, or settle on a single provider.
-- Finalize the storage backend. `IMPLEMENTATION.md` uses `hostPath` PVs on local SSD. `NLP.md` uses NFS-backed PVs (`nfs-client` storageClassName on `10.0.0.3`). For `mars` dev with an attached SSD, `hostPath` is simpler and faster. For `netcup` prod, NFS or a CSI driver may be required. Decide now so the K8s manifests don't need rewriting later.
-- Create the `csearch-nlp` namespace, PVs/PVCs, and secrets on `mars`. Wire up ArgoCD so that from this point forward, all K8s resource changes flow through git commits.
-- Create the read-only PostgreSQL role (`csearch_readonly`) with `SELECT`-only grants.
-- Deploy Qdrant (StatefulSet + Service), verify it's healthy, and create the `bill_chunks` collection with the agreed-upon vector dimensions, INT8 quantization, and on-disk HNSW config.
+**Decisions resolved:**
+- **Embedding model:** OpenAI `text-embedding-3-small` (1536 dims) for both dev and prod.
+- **LLM provider:** OpenAI `gpt-5.4-nano` for answer generation.
+- **Storage backend:** `hostPath` PVs on local SSD for `mars`. Likely hostPath for prod too.
+- **Git hosting:** GitHub repo for ArgoCD sync.
+- **Vote data:** Separate `vote_chunks` Qdrant collection alongside `bill_chunks`.
 
-**Done when:** Qdrant is running on `mars`, the collection exists with correct dimensions and indexes (`billid`, `congress`, `billtype`, `year`, `chunk_type`), ArgoCD is syncing the `k8s/` directory, and all secrets are applied.
+**What this covers:**
+- Create the `csearch-nlp` namespace, PVs/PVCs, and secrets on `mars`. Wire up ArgoCD to sync from the GitHub repo so that all K8s resource changes flow through git commits.
+- Create the read-only PostgreSQL role (`csearch_readonly`) with `SELECT`-only grants.
+- Deploy Qdrant (StatefulSet + Service), verify it's healthy, and create the `bill_chunks` collection with 1536-dim vectors, INT8 quantization, and on-disk HNSW config. Create a separate `vote_chunks` collection with the same config.
+
+**Done when:** Qdrant is running on `mars`, both collections exist with correct dimensions and payload indexes (`billid`, `congress`, `billtype`, `year`, `chunk_type`), ArgoCD is syncing the `k8s/` directory from GitHub, and all secrets are applied.
 
 ---
 
@@ -121,7 +125,7 @@ This is the most time-intensive step. The goal is to go from "empty Qdrant colle
 - **Fetcher** (`pipeline/fetcher.py`): Download full bill XML from GovInfo's bulk data endpoint (`https://www.govinfo.gov/bulkdata/BILLS/{congress}/{billtype}/`). Rate-limit at ~10 req/s with exponential backoff. Cache all XML locally (NFS or dev machine disk) so re-runs don't re-download. Only fetch the latest version of each bill (enrolled > engrossed > reported > introduced).
 - **Chunker** (`pipeline/chunker.py`): XML-aware section splitting. Preserve `<section>` boundaries (don't split mid-section if < 512 tokens). Split long sections at `<paragraph>` or `<subsection>` elements with 64-token overlap. Prepend bill context to every chunk (`"[H.R. 1234, 118th Congress] Section 3: Definitions — "`). Filter out boilerplate sections (effective date, severability, authorization of appropriations, short title). Extract definitions sections as their own dedicated chunks.
 - **Chunk types to ingest**: Titles (~500K), Summaries (~1M), Full-text substantive sections (~5M), Definitions (~500K), Actions timeline (~1.5M), Sponsor blocks (~500K). Estimated total: ~8M chunks.
-- **Batcher** (`pipeline/batcher.py`): Batch embed chunks via Ollama (dev) or OpenAI API (prod). On the dev machine with RTX 3090, use `nomic-embed-text` via Ollama to avoid API costs entirely. 4 parallel workers, batch size 100.
+- **Batcher** (`pipeline/batcher.py`): Batch embed chunks via OpenAI `text-embedding-3-small`. Use batches of 500–1000 strings per API call. Checkpoint embedded results to disk so failed runs can resume without re-paying for already-embedded chunks.
 - **Upserter** (`pipeline/upserter.py`): Stream embedded vectors to Qdrant over a `kubectl port-forward` from the dev machine. The dev machine does the heavy lifting; only final vectors cross the wire.
 - **Tracker** (`pipeline/tracker.py`): Track which bills have been embedded (sync state) so incremental runs only process new/updated bills.
 
@@ -152,7 +156,7 @@ Wrap the retrieval pipeline in a FastAPI service and add LLM-powered answer gene
 **What this covers:**
 - **FastAPI app** (`api/server.py`, `api/routes.py`, `api/models.py`): `POST /api/nlp/search` accepting a query string and optional filters. `GET /health` for liveness/readiness probes.
 - **Prompt builder** (`rag/prompt_builder.py`): Construct the LLM prompt from the 10 ranked bills. Template includes: bill number, title, congress, introduced date, status, sponsors, matched chunk text with section titles, and summary. Rules instruct the LLM to cite specific bill numbers, quote statutory language, compare approaches, and never fabricate.
-- **Generator** (`rag/generator.py`): Stream the LLM response. Use Claude Sonnet (prod) or Ollama `qwen2.5:7b` (dev). Per-query context is ~5–10K tokens (10 bills × 1–3 matched chunks + metadata).
+- **Generator** (`rag/generator.py`): Stream the LLM response via OpenAI `gpt-5.4-nano`. Per-query context is ~5–10K tokens (10 bills × 1–3 matched chunks + metadata). Cost per query is negligible (~$0.001).
 - **SSE streaming format**: Three event types — `sources` (bill list with scores, sent immediately after retrieval), `token` (incremental LLM text), `done` (usage stats). This lets the frontend show source bills before the answer finishes generating.
 - **Caching** (`cache/redis_cache.py`): Layer caches on the shared CSearch Redis with `nlp:` key prefix. Cache query embeddings (24h TTL), Qdrant+RRF results (1h), re-ranked results (1h), LLM responses (1h), and bill metadata (6h). Critical for on-disk Qdrant — repeated queries hit Redis (~1ms) instead of disk HNSW (~150ms).
 - **Dockerize**: Build the image with the cross-encoder model baked in (downloaded at build time). Push to the private registry at `10.0.0.3:30252`.
@@ -210,8 +214,8 @@ All services share a single 4 CPU / 8 GB RAM VPS node. Approximate memory alloca
 | Process | Requests | Limits | Notes |
 |---|---|---|---|
 | PostgreSQL (existing) | ~1 GB | ~2 GB | Unchanged |
-| Qdrant | 1.5 GB | 2 GB | INT8 quantized vectors in RAM, HNSW + payloads on disk |
-| csearch-nlp API | 1 GB | 2 GB | Includes cross-encoder model (~500 MB) |
+| Qdrant | 1.5 GB | 2 GB | INT8 quantized vectors in RAM, HNSW + payloads on disk (hostPath SSD) |
+| csearch-nlp API | 1 GB | 2 GB | Lighter footprint if cross-encoder is replaced by OpenAI reranking |
 | Redis (existing) | ~256 MB | ~512 MB | NLP adds ~50 MB for caches |
 | OS + K8s overhead | ~512 MB | — | kubelet, kernel, etc. |
 | **Total (steady state)** | **~4.3 GB** | **~7 GB** | Fits in 8 GB with headroom |
@@ -222,31 +226,31 @@ The midnight goscraper CronJob and 00:30 NLP sync CronJob overlap briefly. Both 
 
 ## Open Questions
 
-These need to be resolved before or during implementation. Numbered for easy reference in future discussions.
+Previous questions (Q1–Q9) have been resolved and archived in [`docs/ANSWERED.md`](docs/ANSWERED.md). The following are new implementation-level questions that need to be addressed during development.
 
-**Q1 — Embedding model consistency across dev and prod.**
-If dev uses Ollama `nomic-embed-text` (768 dims) and prod uses OpenAI `text-embedding-3-small` (1536 dims), the Qdrant collections are structurally incompatible — you'd have to re-embed the entire corpus when migrating to prod. Options: (a) use OpenAI for both dev and prod (accept the ~$32 batch cost), (b) use Ollama for both and accept slightly lower embedding quality in prod, or (c) treat the dev collection as throwaway and plan a full re-embed for prod. Which approach?
+**Q10 — GovInfo XML schema variations across Congress numbers.**
+The XML structure of bills has evolved over 50 years. Early Congresses (93rd–100th) may use different tag names, nesting structures, or entirely different document formats than modern ones (110th+). The chunker built for Project TARP targets `<section>`, `<paragraph>`, and `<subsection>` tags from 110th Congress XML. How much structural variation exists, and should the chunker have Congress-era-specific parsing paths, or can a single parser handle all eras with graceful fallbacks?
 
-**Q2 — Ollama networking in K8s.**
-Ollama runs on the local machine with the RTX 3090. Is it a native host process or containerized? The K8s pods (API and sync CronJob) need a reachable endpoint — either `http://host.docker.internal:11434`, a K8s Service pointing to a host port, or a NodePort. What's the current Ollama setup?
+**Q11 — OpenAI Batch API vs. standard API for initial embedding.**
+OpenAI's Batch API costs 50% less ($0.01/1M tokens vs. $0.02/1M) but processes within a 24-hour window rather than real-time. For the initial bulk embedding of ~10M chunks, the Batch API could cut the full corpus cost from ~$32 to ~$16. Should Project TARP use the Batch API to validate the workflow, or stick with the standard API for faster iteration?
 
-**Q3 — LLM provider for generation.**
-Three options appear across the docs: Claude Sonnet (NLP.md), OpenAI (README), and Ollama `qwen2.5:7b` (IMPLEMENTATION.md configmap). For dev, Ollama is free but lower quality. For prod, Claude or OpenAI gives much better answer synthesis. Is the plan to use Ollama for dev iteration and Claude Sonnet for prod? Should the code abstract over both via a common interface?
+**Q12 — Vote chunk schema design.**
+Votes are confirmed as a separate `vote_chunks` collection. But what text actually gets embedded for a vote? Options include: (a) the vote question/description text only, (b) the question text plus a summary of the outcome ("Passed 220-215"), (c) the question text plus the full member roll call serialized as text. Option (c) would be enormous. What level of vote detail is useful for semantic search?
 
-**Q4 — Git hosting and ArgoCD.**
-ArgoCD needs a reachable git remote to sync from. Is the `csearch-nlp` repo going on GitHub/GitLab, or is there a self-hosted Gitea/Forgejo instance on the cluster? If it's not yet on a remote, ArgoCD can't auto-sync — deployment would be manual `kubectl apply` until the repo is pushed upstream.
+**Q13 — Chunk deduplication strategy.**
+Bills go through multiple versions (Introduced → Reported → Engrossed → Enrolled). The plan is to embed only the latest version, but "latest" isn't always "best" — an Introduced version of a bill that died in committee may be the only version that exists. Additionally, companion bills (House + Senate versions of the same legislation) have near-identical text. Should we deduplicate across companion bills, or let the vector DB naturally cluster them and rely on the reranker to collapse duplicates?
 
-**Q5 — Storage backend: hostPath vs. NFS.**
-`IMPLEMENTATION.md` uses `hostPath` PVs (fast, local SSD). `NLP.md` uses NFS PVs (`nfs-client` on `10.0.0.3`). For Qdrant with on-disk HNSW, SSD latency matters — NFS adds a network hop that could push cold-cache queries from ~150ms to 300ms+. Is the `mars` dev node equipped with local SSD? Should we use `hostPath` for `mars` and defer the NFS decision to `netcup` prod?
+**Q14 — OpenAI API key management for the pipeline.**
+Project TARP runs locally on the dev machine, not in K8s. The OpenAI API key needs to be available to the Python scripts. Should it be loaded from a `.env` file (gitignored), an environment variable, or pulled from the existing K8s secrets store? For the eventual K8s deployment, the key will live in `csearch-nlp-secrets`, but the local pipeline needs its own access pattern.
 
-**Q6 — Production migration strategy.**
-The prod environment (`netcup`) is a separate remote VPS without a GPU. When it's time to deploy there, the Qdrant DB either needs to be (a) re-embedded from scratch using API-based embeddings, (b) snapshot-synced from `mars`, or (c) served from `mars` and proxied. How much thought should go into this now vs. after the dev pipeline stabilizes?
+**Q15 — Qdrant collection indexing strategy.**
+The plan calls for payload indexes on `billid`, `congress`, `billtype`, `year`, and `chunk_type`. Qdrant supports keyword, integer, and float payload indexes. Should `congress` and `year` be integer indexes (enabling range queries like "Congress 110–118") or keyword indexes (simpler but no range support)? Should we add a `sponsor` keyword index to support sponsor-filtered searches?
 
-**Q7 — Vote data.**
-The README and Phase 1 CLI commands reference `--include-votes` and a `vote_chunks` collection, but `NLP.md` only defines a `bill_chunks` collection. Are votes a separate collection, a chunk type within `bill_chunks`, or deferred to a later phase?
+**Q16 — Chunk overlap token count tuning.**
+The current plan uses 64-token overlap between split chunks. This is a guess. Too little overlap and the model misses context that spans chunk boundaries; too much overlap inflates the total chunk count (and therefore embedding cost). Should Project TARP test multiple overlap values (0, 32, 64, 128) on a small sample and compare retrieval quality before committing to the full batch?
 
-**Q8 — API authentication.**
-For `mars` dev, no auth is needed. But once this is exposed via the frontend in production, should the `/api/nlp/search` endpoint require authentication? Rate limiting? The LLM generation step is the most expensive per-request — an unauthenticated endpoint could run up costs quickly.
+**Q17 — Error recovery for partial embedding runs.**
+If the OpenAI embedding batch fails midway through (network error, rate limit, API outage), the pipeline needs to resume from where it left off without re-embedding already-processed chunks. The current plan checkpoints to `embedded_chunks.json`, but for 10M chunks this file would be enormous (~50GB+). Should the tracker use a lightweight SQLite database or a simple offset log instead of a monolithic JSON file?
 
-**Q9 — Cross-encoder model size on VPS.**
-The cross-encoder (`ms-marco-MiniLM-L-12-v2`, ~130MB on disk, ~500MB under load) runs on CPU within the API pod. With the API pod limited to 2 GB, and the model taking ~500 MB, that leaves ~1.5 GB for the FastAPI process, async request handling, and Python overhead. Is this sufficient under concurrent load, or should we consider a lighter model or a separate sidecar?
+**Q18 — Nightly sync: OpenAI cost for daily incremental updates.**
+The nightly sync job embeds ~100 new bills/day (~10K chunks). At `text-embedding-3-small` pricing, this is ~$0.005/day or ~$1.80/year — effectively free. But should the sync job have a hard spending cap or alert threshold to catch unexpected spikes (e.g., if a bulk data dump suddenly adds thousands of historical bills)?

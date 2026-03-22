@@ -1,0 +1,19 @@
+# Downloaded bill/vote data (large XML/JSON files)
+110/
+project-tarp/data/
+
+# Processed/embedded data checkpoints
+*.json
+!package.json
+!package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment
+.env
+
+# macOS
+.DS_Store
