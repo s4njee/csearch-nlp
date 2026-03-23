@@ -5,6 +5,25 @@ Build a minimal, end-to-end pipeline to download all U.S. Congressional bills fr
 
 This is a proof-of-concept (POC) to validate the chunking strategy and OpenAI embedding costs before scaling to the full 50-year dataset in the main `csearch-nlp` repository.
 
+## POC Status
+**Status:** ✅ End-to-end POC complete
+
+The Project TARP pipeline now runs end to end for the 110th Congress:
+
+- raw bill text fetched from GovInfo
+- bill text parsed and chunked with exact section-level dedup
+- full corpus embedded with OpenAI `text-embedding-3-small`
+- vectors loaded into Qdrant on the `mars` Kubernetes cluster
+- semantic search and grounded answer generation working through `query.py`
+
+Representative observed outputs:
+
+- chunking: `439,890` canonical chunks across `21` shards
+- dedup: `11,571` duplicate sections removed
+- embedding tokens: `55,260,842`
+- full-corpus embedding cost: about `$1.11`
+- Qdrant endpoint: `http://192.168.1.156:6333`
+
 ## Tech Stack
 - **Language**: Python 3.10+
 - **Data Source**: GovInfo content API + `@unitedstates/congress` scraper metadata
@@ -111,27 +130,21 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Output format: one embedded chunk per JSONL line, with the original chunk metadata plus an `"embedding"` field containing the 1536-float vector. The embedded shard directory also gets a lightweight `manifest.json`.
 - Supports `--model` and `--dimensions` flags for experimenting with `text-embedding-3-large`.
 
-### Step 4: Storage Setup (Qdrant Upsert) — IN PROGRESS
+### Step 4: Storage Setup (Qdrant Upsert) ✅ COMPLETE
 **Goal:** Load the vectors and metadata into a local Qdrant instance.
 - `upserter.py` is implemented and reads embedded shard files from `./data/embedded_chunks/`.
 - Qdrant is deployed on the `mars` Kubernetes context in namespace `csearch-nlp` with a `LoadBalancer` service.
 - Current external endpoint: REST `http://192.168.1.156:6333`, gRPC `192.168.1.156:6334`.
-- The service is healthy (`/readyz` returns `all shards are ready`) and the `bill_chunks` collection is being populated now.
+- The service is healthy (`/readyz` returns `all shards are ready`) and the `bill_chunks` collection has been populated from the embedded shard output.
 - Upserts use deterministic UUID point IDs derived from canonical chunk identity so reruns are stable.
 - Payloads are intentionally lean by default; large alias arrays are omitted unless explicitly requested.
 
-### Step 5: The Query Engine & Answer Generation — NOT STARTED
+### Step 5: The Query Engine & Answer Generation ✅ COMPLETE
 **Goal:** Run semantic searches and generate readable answers using OpenAI's latest models.
-- Write a Python script (`query.py`).
-- Accept a natural language query from stdin.
-- Embed the query via `text-embedding-3-small` (single API call, cost: ~$0.000002).
-- Search Qdrant `bills_2008_test` for the top 5 closest vectors.
-- Display matched chunks: score, bill ID, section header, and a text snippet.
-- Pass the top 5 chunks as context to `gpt-5.4-nano` with a system prompt instructing it to cite specific bill numbers, quote statutory language, and never fabricate.
-- Print the generated answer to the terminal.
-- **Test queries to validate:**
-  - "What did Congress do about the financial crisis in 2008?"
-  - "bills about bank bailouts"
-  - "legislation regulating subprime mortgages"
-  - "environmental protection bills from the 110th Congress"
-  - "bills related to veterans healthcare"
+- `query.py` is implemented as an interactive CLI over the `bill_chunks` Qdrant collection.
+- The query path embeds the user query with `text-embedding-3-small`, searches Qdrant, prints the top semantic matches, and optionally asks `gpt-5.4-nano` for a grounded answer.
+- The first end-to-end test query was successful:
+  - Query: `"What did Congress do about the financial crisis in 2008?"`
+  - Top hits included `hr7275-110`, `hr7104-110`, and `hr3666-110`
+  - The generated answer correctly summarized the retrieved excerpts as proposed commissions/investigations plus foreclosure-related findings, while explicitly noting uncertainty where the retrieved excerpts did not show enacted remedies.
+- A sample run is recorded in `SAMPLE.md`.
