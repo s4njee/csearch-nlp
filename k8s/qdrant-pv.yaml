@@ -7,7 +7,7 @@ spec:
     storage: 50Gi
   accessModes:
     - ReadWriteOnce
-  storageClassName: standard
+  storageClassName: ""
   hostPath:
     path: /mnt/data/qdrant
     type: DirectoryOrCreate
@@ -18,6 +18,8 @@ metadata:
   name: qdrant-pvc
   namespace: csearch-nlp
 spec:
+  volumeName: qdrant-pv
+  storageClassName: ""
   accessModes:
     - ReadWriteOnce
   resources:

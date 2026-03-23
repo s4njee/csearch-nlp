@@ -1,6 +1,6 @@
 # Project TARP — Roadmap & ToDo
 
-Last updated: 2026-03-22
+Last updated: 2026-03-23
 
 ---
 
@@ -9,12 +9,12 @@ Last updated: 2026-03-22
 | Component | Status | Notes |
 |---|---|---|
 | `fetcher.py` | ✅ Complete | 7,960 bills discovered, 7,789 XML files downloaded |
-| `chunker.py` | ✅ Code complete | Tested on 20 bills → 432 chunks. Needs full run on all 7,789 bills |
-| `embedder.py` | ✅ Code complete | Not yet run (waiting on full chunk set) |
-| `upserter.py` | ❌ Not started | Needs to be written |
+| `chunker.py` | ✅ Complete | Full Congress 110 run completed; 439,890 chunks across 21 shards with section dedup enabled |
+| `embedder.py` | ✅ Complete | Full embedding run completed to sharded output under `data/embedded_chunks/` |
+| `upserter.py` | 🟡 In progress | Implemented; currently upserting embedded shards into Qdrant |
 | `query.py` | ❌ Not started | Needs to be written |
-| Qdrant | ❌ Not running | Docker container not yet started |
-| OpenAI API key | ❓ Unknown | Needs to be set as `OPENAI_API_KEY` env var |
+| Qdrant | 🟡 Running | Deployed on `mars` in namespace `csearch-nlp` via LoadBalancer at `192.168.1.156:6333` |
+| OpenAI API key | ✅ Set | Used for the completed embedding run |
 
 ---
 
@@ -37,123 +37,91 @@ Last updated: 2026-03-22
 
 ---
 
-## Phase 2: Chunking (Next Up)
+## Phase 2: Chunking ✅ COMPLETE
 
-The chunker code is complete and tested on a 20-bill sample (produced 432 chunks). Now it needs to process all ~7,789 downloaded bills.
+The chunker has been run on the full Congress 110 dataset and now writes deduplicated JSONL shards plus a manifest.
 
-- [ ] **Install tiktoken** if not already present (the chunker falls back to word-count estimation without it, but real token counts are critical for accurate cost estimates)
+- [x] **Install tiktoken** if not already present (the chunker falls back to word-count estimation without it, but real token counts are critical for accurate cost estimates)
   ```bash
   pip install tiktoken
   ```
-- [ ] **Run the chunker on the full dataset**
+- [x] **Run the chunker on the full dataset**
   ```bash
   cd project-tarp
   python chunker.py --congresses 110
   ```
-  This will overwrite `data/processed_chunks.json` with all chunks from all 7,789 bills.
-- [ ] **Inspect the output** — verify chunk quality before spending money on embeddings
+  Current chosen run used `--max-chunks-per-bill 300` and writes shard output under `data/processed_chunks/110/`.
+- [x] **Inspect the output** — verify chunk quality before spending money on embeddings
   ```bash
-  # Summary stats
-  python3 -c "
-  import json
-  d = json.load(open('data/processed_chunks.json'))
-  tokens = sum(c['tokens'] for c in d)
-  bills = len(set(c['bill_id'] for c in d))
-  print(f'Total chunks: {len(d):,}')
-  print(f'Unique bills: {bills:,}')
-  print(f'Total tokens: {tokens:,}')
-  print(f'Avg tokens/chunk: {tokens//len(d)}')
-  print(f'Estimated embedding cost: \${tokens/1_000_000*0.02:.4f}')
-  "
+  cat data/processed_chunks/110/manifest.json
   ```
-  **Expected output:** ~100K–200K chunks, ~$0.50–$1.00 estimated cost.
-- [ ] **Spot-check 5–10 chunks manually** to verify:
+  **Observed output:** 439,890 chunks across 21 shards, 10,493 canonical bills with chunks, 11,571 duplicate sections removed, ~55.3M tokens for embedding.
+- [x] **Spot-check 5–10 chunks manually** to verify:
   - Context prefix is correct (e.g., `[H.R. 1424, 110th Congress] Section 101: ...`)
   - Boilerplate sections (short title, effective date) are being filtered out
   - Long sections are split cleanly at subsection boundaries
   - No garbage text or XML tags leaking through
-  ```bash
-  # Print a few random chunks
-  python3 -c "
-  import json, random
-  d = json.load(open('data/processed_chunks.json'))
-  for c in random.sample(d, 5):
-      print(f\"--- {c['bill_id']} §{c['section_enum']} [{c['tokens']} tok] ---\")
-      print(c['text'][:300])
-      print()
-  "
-  ```
-- [ ] **Decide: is the chunking quality good enough?** If not, tune these knobs:
+- [x] **Decide: is the chunking quality good enough?** Current answer: yes for the POC. Final chosen knob changes were:
   - `--max-tokens` (default 512) — smaller = more chunks but tighter semantic focus
   - `--overlap` (default 64) — more overlap = better cross-boundary recall but higher cost
-  - `--max-chunks-per-bill` (default 200) — safety cap for enormous bills
+  - `--max-chunks-per-bill 300` — higher cap after testing showed 200 was too aggressive for monster bills
 
 ---
 
-## Phase 3: Embedding (OpenAI API Call)
+## Phase 3: Embedding ✅ COMPLETE
 
-This is the step that costs real money (~$0.50–$1.00 for Congress 110). Do not rush into this until Phase 2 output looks clean.
+Embedding is complete and now writes mirrored JSONL shards under `data/embedded_chunks/` instead of one giant checkpoint file.
 
-- [ ] **Set the OpenAI API key**
+- [x] **Set the OpenAI API key**
   ```bash
   export OPENAI_API_KEY='sk-...'
   ```
-- [ ] **Do a dry run first** to confirm the cost estimate
+- [x] **Do a dry run first** to confirm the cost estimate
   ```bash
   cd project-tarp
   python embedder.py --dry-run
   ```
-- [ ] **Run the embedder**
+- [x] **Run the embedder**
   ```bash
   python embedder.py
   ```
   This will:
-  - Read `data/processed_chunks.json`
-  - Send batches of 500 texts to OpenAI `text-embedding-3-small`
-  - Save results to `data/embedded_chunks.json` as a checkpoint
-  - If interrupted, re-running will resume from where it left off (incremental)
-- [ ] **Verify the checkpoint file**
+  - Read `data/processed_chunks/`
+  - Send batches to OpenAI `text-embedding-3-small`
+  - Save mirrored results to `data/embedded_chunks/`
+  - Resume shard-locally if interrupted
+- [x] **Verify the embedded output**
   ```bash
-  python3 -c "
-  import json
-  d = json.load(open('data/embedded_chunks.json'))
-  print(f\"Model: {d['model']}\")
-  print(f\"Dimensions: {d['dimensions']}\")
-  print(f\"Chunks: {d['count']}\")
-  print(f\"First vector length: {len(d['chunks'][0]['embedding'])}\")
-  "
+  find data/embedded_chunks -maxdepth 2 -name 'shard-*.jsonl' | head
   ```
-  Confirm: model is `text-embedding-3-small`, dimensions is `1536`, and every chunk has a 1536-element `embedding` array.
+  Confirmed: embedded shards exist, vectors are 1536-dim, and output size is ~13G.
 
 ---
 
-## Phase 4: Qdrant Setup & Upsert
+## Phase 4: Qdrant Setup & Upsert 🟡 IN PROGRESS
 
-- [ ] **Start a local Qdrant instance**
-  ```bash
-  docker run -d --name qdrant -p 6333:6333 -v $(pwd)/data/qdrant_storage:/qdrant/storage qdrant/qdrant
-  ```
-- [ ] **Write `upserter.py`** — script that:
-  - Connects to Qdrant at `localhost:6333`
-  - Creates (or recreates) collection `bills_2008_test` with `size=1536`, `distance=Cosine`
-  - Creates payload indexes on `congress` (integer), `type` (keyword), `bill_id` (keyword)
-  - Reads `data/embedded_chunks.json`
-  - Upserts vectors in batches (100–500 per call) with payloads containing:
-    - `bill_id`, `congress`, `type`, `number`, `short_title`
-    - `section_enum`, `section_header`, `chunk_index`
-    - `text` (the original chunk text, for display in search results)
-  - Logs progress and final collection point count
+- [x] **Deploy Qdrant on `mars` Kubernetes**
+  - Namespace: `csearch-nlp`
+  - Service type: `LoadBalancer`
+  - External REST endpoint: `http://192.168.1.156:6333`
+  - External gRPC endpoint: `192.168.1.156:6334`
+- [x] **Write `upserter.py`**
+  - Reads `data/embedded_chunks/`
+  - Uses deterministic UUID point IDs
+  - Defaults to Qdrant host `192.168.1.156:6333`
+  - Targets collection `bill_chunks`
+  - Keeps payloads lean by default
 - [ ] **Run the upserter**
   ```bash
   cd project-tarp
   python upserter.py
   ```
-- [ ] **Verify collection health**
+- [ ] **Verify collection health after ingestion completes**
   ```bash
   python3 -c "
   from qdrant_client import QdrantClient
-  c = QdrantClient('localhost', port=6333)
-  info = c.get_collection('bills_2008_test')
+  c = QdrantClient('192.168.1.156', port=6333)
+  info = c.get_collection('bill_chunks')
   print(f'Points: {info.points_count}')
   print(f'Vectors: {info.vectors_count}')
   print(f'Status: {info.status}')
@@ -195,7 +163,7 @@ This is the step that costs real money (~$0.50–$1.00 for Congress 110). Do not
   tiktoken
   qdrant-client
   ```
-- [ ] **Update `PLAN.md`** with actual results (chunk counts, cost, quality observations)
+- [x] **Update `PLAN.md`** with actual results (chunk counts, cost, quality observations)
 - [ ] **Write findings** — what worked, what didn't, what to change before scaling to all 50 years
 - [ ] **Commit and push** the final project-tarp code (excluding data files)
 

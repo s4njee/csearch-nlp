@@ -188,6 +188,21 @@ def alias_sort_key(alias: dict) -> tuple:
     )
 
 
+def canonical_bill_sort_key(chunk_or_alias: dict) -> tuple:
+    """Sort canonical bills by congress, type, then numeric bill number when possible."""
+    number = str(chunk_or_alias.get("number", ""))
+    try:
+        number_key = (0, int(number))
+    except ValueError:
+        number_key = (1, number)
+    return (
+        int(chunk_or_alias.get("congress", 0)),
+        chunk_or_alias.get("type", ""),
+        number_key,
+        chunk_or_alias.get("canonical_bill_id", chunk_or_alias.get("bill_id", "")),
+    )
+
+
 def dedupe_records(records: list[dict], key_fields: tuple[str, ...]) -> list[dict]:
     seen = set()
     unique = []
@@ -620,7 +635,7 @@ def apply_chunk_filters(chunks: list[dict], min_tokens: int, cap: int) -> tuple[
     below_min = before - len(filtered)
 
     if cap <= 0:
-        return filtered, below_min, 0
+        return renumber_chunk_indexes(filtered), below_min, 0
 
     by_bill = defaultdict(list)
     for chunk in filtered:
@@ -633,15 +648,67 @@ def apply_chunk_filters(chunks: list[dict], min_tokens: int, cap: int) -> tuple[
             capped_chunks.extend(bill_chunks)
             continue
 
-        bill_chunks.sort(key=lambda c: c["tokens"], reverse=True)
-        kept = bill_chunks[:cap]
+        by_section = defaultdict(list)
+        for chunk in bill_chunks:
+            section_key = (
+                chunk.get("section_text_hash", ""),
+                chunk.get("section_enum", ""),
+                chunk.get("section_header", ""),
+            )
+            by_section[section_key].append(chunk)
+
+        must_keep = []
+        remaining = []
+        for section_chunks in by_section.values():
+            section_chunks.sort(
+                key=lambda c: (-c["tokens"], c.get("chunk_index", 0))
+            )
+            must_keep.append(section_chunks[0])
+            remaining.extend(section_chunks[1:])
+
+        if len(must_keep) >= cap:
+            must_keep.sort(
+                key=lambda c: (-c["tokens"], c.get("section_enum", ""), c.get("chunk_index", 0))
+            )
+            kept = must_keep[:cap]
+        else:
+            remaining.sort(
+                key=lambda c: (-c["tokens"], c.get("section_enum", ""), c.get("chunk_index", 0))
+            )
+            kept = must_keep + remaining[:cap - len(must_keep)]
+
         kept.sort(key=lambda c: (c.get("section_enum", ""), c.get("chunk_index", 0)))
         capped_chunks.extend(kept)
         dropped = len(bill_chunks) - cap
         total_dropped += dropped
         log.info(f"  Capped {canonical_bill_id}: {len(bill_chunks)} → {cap} chunks ({dropped} dropped)")
 
-    return capped_chunks, below_min, total_dropped
+    return renumber_chunk_indexes(capped_chunks), below_min, total_dropped
+
+
+def renumber_chunk_indexes(chunks: list[dict]) -> list[dict]:
+    """Reassign contiguous chunk indexes after filtering/capping, preserving the original value."""
+    grouped = defaultdict(list)
+    for chunk in chunks:
+        section_key = (
+            chunk["canonical_bill_id"],
+            chunk.get("section_text_hash", ""),
+            chunk.get("section_enum", ""),
+            chunk.get("section_header", ""),
+        )
+        grouped[section_key].append(chunk)
+
+    renumbered = []
+    for section_key, section_chunks in grouped.items():
+        section_chunks.sort(key=lambda c: (c.get("section_enum", ""), c.get("chunk_index", 0)))
+        for new_index, chunk in enumerate(section_chunks):
+            updated = dict(chunk)
+            updated["original_chunk_index"] = chunk.get("original_chunk_index", chunk.get("chunk_index", 0))
+            updated["chunk_index"] = new_index
+            renumbered.append(updated)
+
+    renumbered.sort(key=lambda c: (canonical_bill_sort_key(c), c.get("section_enum", ""), c.get("chunk_index", 0)))
+    return renumbered
 
 
 def write_congress_shards(
@@ -665,7 +732,10 @@ def write_congress_shards(
     for chunk in chunks:
         by_bill[chunk["canonical_bill_id"]].append(chunk)
 
-    ordered_bill_ids = sorted(by_bill.keys())
+    ordered_bill_ids = sorted(
+        by_bill.keys(),
+        key=lambda bill_id: canonical_bill_sort_key(by_bill[bill_id][0]),
+    )
     manifest = []
     shard_index = 1
     current_bill_ids = []
@@ -713,6 +783,8 @@ def write_congress_shards(
         "canonical_documents": stats.get("canonical_documents", 0),
         "duplicate_documents": stats.get("duplicate_documents", 0),
         "duplicate_sections": stats.get("duplicate_sections", 0),
+        "filtered_below_min_tokens": stats.get("filtered_below_min_tokens", 0),
+        "dropped_by_bill_cap": stats.get("dropped_by_bill_cap", 0),
         "chunks_written": len(chunks),
         "shard_count": len(manifest),
         "shards": manifest,
@@ -806,6 +878,8 @@ def main():
             log.info(f"  → filtered out {below_min} chunks below 30 tokens")
         if capped:
             log.info(f"  → dropped {capped} chunks via per-bill cap")
+        stats["filtered_below_min_tokens"] = below_min
+        stats["dropped_by_bill_cap"] = capped
         for key, value in stats.items():
             total_stats[key] += value
         stats["chunks_written"] = len(chunks)

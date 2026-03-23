@@ -2,30 +2,31 @@
 """
 embedder.py — Convert text chunks into vector embeddings via OpenAI API.
 
-Reads processed_chunks.json, batches the text, calls the OpenAI embeddings
-API, and saves the result as embedded_chunks.json (a checkpoint file so the
-API call doesn't need to be re-run during downstream debugging).
+Reads processed JSONL shard files, batches the text, calls the OpenAI
+embeddings API, and writes embedded JSONL shards that mirror the input layout.
 
-Supports incremental embedding: if embedded_chunks.json already exists,
-only new/unembedded chunks are sent to the API.
+Supports incremental embedding: if an output shard already exists, only
+missing/unembedded chunks in that shard are sent to the API.
 
 Requires:
     pip install openai
     export OPENAI_API_KEY=sk-...
 
 Usage:
-    python embedder.py                             # embed all chunks
-    python embedder.py --model text-embedding-3-large --dimensions 1536
+    python embedder.py                             # embed all chunk shards
     python embedder.py --batch-size 500            # smaller batches
+    python embedder.py --delay-seconds 3           # slower pace between batches
+    python embedder.py --checkpoint-every 10       # save every 10 batches
     python embedder.py --dry-run                   # show cost estimate only
 """
 
 import argparse
 import json
-import time
 import logging
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -40,13 +41,15 @@ except ImportError:
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 INPUT_FILE = DATA_DIR / "processed_chunks"
-OUTPUT_FILE = DATA_DIR / "embedded_chunks.json"
+OUTPUT_FILE = DATA_DIR / "embedded_chunks"
 
 DEFAULT_MODEL = "text-embedding-3-small"
 DEFAULT_DIMENSIONS = 1536
-DEFAULT_BATCH_SIZE = 500  # OpenAI supports up to 2048 inputs per request
+DEFAULT_BATCH_SIZE = 500
+DEFAULT_DELAY_SECONDS = 3.0
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_CHECKPOINT_EVERY = 10
 
-# Pricing per 1M tokens (as of 2025)
 PRICING = {
     "text-embedding-3-small": 0.02,
     "text-embedding-3-large": 0.13,
@@ -58,10 +61,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("embedder")
+SHARD_NAME_RE = re.compile(r"^shard-\d{5}\.jsonl$")
 
 
 # ---------------------------------------------------------------------------
-# Embedding
+# Helpers
 # ---------------------------------------------------------------------------
 
 def embed_batch(client: OpenAI, texts: list[str], model: str, dimensions: int) -> list[list[float]]:
@@ -71,29 +75,30 @@ def embed_batch(client: OpenAI, texts: list[str], model: str, dimensions: int) -
         model=model,
         dimensions=dimensions,
     )
-    # Response items are in same order as input
     return [item.embedding for item in response.data]
 
 
-def load_chunk_list(path: Path) -> list[dict]:
-    """Load chunks from a JSON file, checkpoint wrapper, or JSONL shard directory."""
-    if path.is_dir():
-        chunks = []
-        for shard_path in sorted(path.rglob("shard-*.jsonl")):
-            with shard_path.open(encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        chunks.append(json.loads(line))
-        return chunks
+def read_jsonl(path: Path) -> list[dict]:
+    """Read JSONL records from a file."""
+    records = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
-    data = json.loads(path.read_text())
-    if isinstance(data, dict):
-        chunks = data.get("chunks", [])
-        if isinstance(chunks, list):
-            return chunks
-        return []
-    return data if isinstance(data, list) else []
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    """Write JSONL records atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, separators=(",", ":")))
+            f.write("\n")
+    tmp_path.replace(path)
+    log.info(f"Checkpoint saved: {path} ({len(records)} chunks)")
 
 
 def chunk_identity(chunk: dict) -> tuple[str, str, int]:
@@ -113,18 +118,82 @@ def chunk_identity(chunk: dict) -> tuple[str, str, int]:
     )
 
 
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Best-effort detection for 429/rate-limit responses across client versions."""
+    text = str(exc).lower()
+    return "429" in text or "rate limit" in text or "ratelimit" in text
+
+
+def iter_input_shards(input_path: Path) -> list[Path]:
+    """Return all input shard files in stable order."""
+    if input_path.is_dir():
+        return sorted(
+            path for path in input_path.rglob("*.jsonl")
+            if SHARD_NAME_RE.fullmatch(path.name)
+        )
+    if input_path.is_file() and SHARD_NAME_RE.fullmatch(input_path.name):
+        return [input_path]
+    raise ValueError(f"Unsupported input path for shard embedding: {input_path}")
+
+
+def shard_output_path(input_root: Path, output_root: Path, shard_path: Path) -> Path:
+    """Map an input shard to its mirrored output shard path."""
+    if input_root.is_dir():
+        return output_root / shard_path.relative_to(input_root)
+    return output_root / shard_path.name
+
+
+def load_existing_shard(path: Path) -> dict[tuple[str, str, int], dict]:
+    """Load embedded records from an output shard indexed by chunk identity."""
+    if not path.exists():
+        return {}
+    existing = {}
+    for record in read_jsonl(path):
+        if "embedding" in record:
+            existing[chunk_identity(record)] = record
+    return existing
+
+
+def build_shard_records(input_chunks: list[dict], embedded_by_key: dict[tuple[str, str, int], dict]) -> list[dict]:
+    """Rebuild shard output in input order using the latest embedded records."""
+    records = []
+    for chunk in input_chunks:
+        key = chunk_identity(chunk)
+        if key in embedded_by_key:
+            records.append(embedded_by_key[key])
+    return records
+
+
+def save_manifest(output_root: Path, summary: dict) -> None:
+    """Save a lightweight run manifest for the embedded shard directory."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / "manifest.json"
+    manifest_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    log.info(f"Manifest saved: {manifest_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Embed text chunks via OpenAI API")
     parser.add_argument("--input", type=str, default=str(INPUT_FILE),
-                        help=f"Input chunks file (default: {INPUT_FILE})")
+                        help=f"Input chunk shard directory (default: {INPUT_FILE})")
     parser.add_argument("--output", type=str, default=str(OUTPUT_FILE),
-                        help=f"Output checkpoint file (default: {OUTPUT_FILE})")
+                        help=f"Output embedded shard directory (default: {OUTPUT_FILE})")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
                         help=f"Embedding model (default: {DEFAULT_MODEL})")
     parser.add_argument("--dimensions", type=int, default=DEFAULT_DIMENSIONS,
                         help=f"Embedding dimensions (default: {DEFAULT_DIMENSIONS})")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Texts per API call (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--delay-seconds", type=float, default=DEFAULT_DELAY_SECONDS,
+                        help=f"Seconds to wait between successful batches (default: {DEFAULT_DELAY_SECONDS})")
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                        help=f"Max retries for rate-limited batches (default: {DEFAULT_MAX_RETRIES})")
+    parser.add_argument("--checkpoint-every", type=int, default=DEFAULT_CHECKPOINT_EVERY,
+                        help=f"Save checkpoint every N successful batches within a shard (default: {DEFAULT_CHECKPOINT_EVERY})")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show cost estimate without calling the API")
     args = parser.parse_args()
@@ -132,42 +201,51 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output)
 
-    # Load chunks
     if not input_path.exists():
-        log.error(f"Input file not found: {input_path}")
+        log.error(f"Input path not found: {input_path}")
         log.error("Run chunker.py first to generate processed chunk shards")
         return
-    chunks = load_chunk_list(input_path)
-    log.info(f"Loaded {len(chunks)} chunks from {input_path}")
 
-    # Load existing checkpoint for incremental embedding
-    existing = {}
-    if output_path.exists():
-        existing_chunks = load_chunk_list(output_path)
-        for ec in existing_chunks:
-            key = chunk_identity(ec)
-            if "embedding" in ec:
-                existing[key] = ec
-        log.info(f"Found {len(existing)} already-embedded chunks in checkpoint")
-
-    # Determine which chunks need embedding
-    to_embed = []
-    already_done = []
-    for c in chunks:
-        key = chunk_identity(c)
-        if key in existing:
-            already_done.append(existing[key])
-        else:
-            to_embed.append(c)
-
-    if not to_embed:
-        log.info("All chunks already embedded. Nothing to do.")
+    try:
+        shard_paths = iter_input_shards(input_path)
+    except ValueError as e:
+        log.error(str(e))
         return
 
-    log.info(f"Need to embed: {len(to_embed)} chunks ({len(already_done)} already done)")
+    if not shard_paths:
+        log.error(f"No input shard files found under {input_path}")
+        return
 
-    # Cost estimate
-    total_tokens = sum(c["tokens"] for c in to_embed)
+    total_chunks = 0
+    total_tokens = 0
+    total_already_done = 0
+    shard_statuses = []
+
+    for shard_path in shard_paths:
+        input_chunks = read_jsonl(shard_path)
+        existing_by_key = load_existing_shard(shard_output_path(input_path, output_path, shard_path))
+        shard_total = len(input_chunks)
+        shard_pending = [chunk for chunk in input_chunks if chunk_identity(chunk) not in existing_by_key]
+        shard_pending_tokens = sum(chunk["tokens"] for chunk in shard_pending)
+
+        total_chunks += shard_total
+        total_tokens += shard_pending_tokens
+        total_already_done += shard_total - len(shard_pending)
+        shard_statuses.append({
+            "input_shard": str(shard_path),
+            "output_shard": str(shard_output_path(input_path, output_path, shard_path)),
+            "chunk_count": shard_total,
+            "already_embedded": shard_total - len(shard_pending),
+            "to_embed": len(shard_pending),
+        })
+
+    if total_chunks == 0:
+        log.info("No chunks found. Nothing to do.")
+        return
+
+    log.info(f"Discovered {len(shard_paths)} shard(s) with {total_chunks} chunk(s) total")
+    log.info(f"Need to embed: {total_chunks - total_already_done} chunks ({total_already_done} already done)")
+
     price_per_m = PRICING.get(args.model, 0.02)
     est_cost = total_tokens / 1_000_000 * price_per_m
     log.info(f"Estimated cost: {total_tokens:,} tokens × ${price_per_m}/1M = ${est_cost:.4f}")
@@ -176,7 +254,6 @@ def main():
         log.info("[DRY RUN] Exiting without calling API")
         return
 
-    # Check API key
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         log.error("OPENAI_API_KEY environment variable not set")
@@ -184,56 +261,108 @@ def main():
 
     client = OpenAI(api_key=api_key)
 
-    # Batch and embed
-    batches = [to_embed[i:i + args.batch_size] for i in range(0, len(to_embed), args.batch_size)]
-    log.info(f"Processing {len(batches)} batches of up to {args.batch_size}")
+    total_embedded_now = 0
+    current_output_shard = None
+    current_input_chunks = None
+    current_embedded_by_key = None
+    try:
+        for shard_index, shard_path in enumerate(shard_paths, 1):
+            output_shard = shard_output_path(input_path, output_path, shard_path)
+            input_chunks = read_jsonl(shard_path)
+            embedded_by_key = load_existing_shard(output_shard)
+            current_output_shard = output_shard
+            current_input_chunks = input_chunks
+            current_embedded_by_key = embedded_by_key
 
-    embedded_count = 0
-    for bi, batch in enumerate(batches, 1):
-        texts = [c["text"] for c in batch]
+            to_embed = [chunk for chunk in input_chunks if chunk_identity(chunk) not in embedded_by_key]
+            if not to_embed:
+                log.info(f"Shard {shard_index}/{len(shard_paths)} already complete: {output_shard}")
+                continue
 
-        try:
-            vectors = embed_batch(client, texts, args.model, args.dimensions)
-        except Exception as e:
-            log.error(f"API error on batch {bi}: {e}")
-            log.info(f"Saving checkpoint with {embedded_count + len(already_done)} embedded chunks")
-            # Save what we have so far
-            _save_checkpoint(output_path, already_done + to_embed[:embedded_count], args)
-            return
+            batches = [to_embed[i:i + args.batch_size] for i in range(0, len(to_embed), args.batch_size)]
+            log.info(
+                f"Shard {shard_index}/{len(shard_paths)}: {shard_path.name} | "
+                f"{len(to_embed)}/{len(input_chunks)} chunks to embed | "
+                f"{len(batches)} batch(es)"
+            )
+            log.info(
+                f"Inter-batch delay: {args.delay_seconds:.1f}s | "
+                f"Max rate-limit retries: {args.max_retries} | "
+                f"Checkpoint every {args.checkpoint_every} batch(es)"
+            )
 
-        # Attach embeddings to chunk records
-        for chunk, vector in zip(batch, vectors):
-            chunk["embedding"] = vector
-            embedded_count += 1
+            shard_embedded_now = 0
+            for bi, batch in enumerate(batches, 1):
+                texts = [chunk["text"] for chunk in batch]
 
-        batch_tokens = sum(c["tokens"] for c in batch)
-        log.info(f"Batch {bi}/{len(batches)}: {len(batch)} chunks, {batch_tokens:,} tokens — done ({embedded_count}/{len(to_embed)})")
+                for attempt in range(args.max_retries + 1):
+                    try:
+                        vectors = embed_batch(client, texts, args.model, args.dimensions)
+                        break
+                    except Exception as e:
+                        if is_rate_limit_error(e) and attempt < args.max_retries:
+                            backoff = args.delay_seconds * (2 ** attempt)
+                            log.warning(
+                                f"Rate limited on shard {shard_index} batch {bi} "
+                                f"(attempt {attempt + 1}/{args.max_retries + 1}); "
+                                f"sleeping {backoff:.1f}s before retry"
+                            )
+                            time.sleep(backoff)
+                            continue
 
-        # Rate limit courtesy
-        if bi < len(batches):
-            time.sleep(0.5)
+                        log.error(f"API error on shard {shard_index} batch {bi}: {e}")
+                        write_jsonl(output_shard, build_shard_records(input_chunks, embedded_by_key))
+                        _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
+                        return
 
-    # Merge with already-done and save
-    all_embedded = already_done + to_embed
-    _save_checkpoint(output_path, all_embedded, args)
+                for chunk, vector in zip(batch, vectors):
+                    updated = dict(chunk)
+                    updated["embedding"] = vector
+                    embedded_by_key[chunk_identity(updated)] = updated
+                    shard_embedded_now += 1
+                    total_embedded_now += 1
 
-    log.info(f"{'='*60}")
-    log.info(f"DONE: {embedded_count} chunks embedded")
-    log.info(f"Total: {len(all_embedded)} chunks in checkpoint")
-    log.info(f"Dimensions: {args.dimensions}")
-    log.info(f"Saved to {output_path}")
+                batch_tokens = sum(chunk["tokens"] for chunk in batch)
+                log.info(
+                    f"Shard {shard_index}/{len(shard_paths)} batch {bi}/{len(batches)}: "
+                    f"{len(batch)} chunks, {batch_tokens:,} tokens — done "
+                    f"({shard_embedded_now}/{len(to_embed)} in shard)"
+                )
+
+                if args.checkpoint_every > 0 and bi % args.checkpoint_every == 0:
+                    write_jsonl(output_shard, build_shard_records(input_chunks, embedded_by_key))
+
+                if bi < len(batches):
+                    time.sleep(args.delay_seconds)
+
+            write_jsonl(output_shard, build_shard_records(input_chunks, embedded_by_key))
+
+    except KeyboardInterrupt:
+        if current_output_shard is not None and current_input_chunks is not None and current_embedded_by_key is not None:
+            write_jsonl(current_output_shard, build_shard_records(current_input_chunks, current_embedded_by_key))
+        log.warning("Interrupted by user; partial shard progress has been checkpointed")
+        _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
+        return
+
+    _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
+    log.info(f"{'=' * 60}")
+    log.info(f"DONE: {total_embedded_now} chunks embedded in this run")
+    log.info(f"Saved embedded shards under {output_path}")
 
 
-def _save_checkpoint(path: Path, chunks: list[dict], args) -> None:
-    """Save embedded chunks with model metadata."""
-    output = {
+def _save_final_manifest(output_root: Path, args, shard_statuses: list[dict], embedded_now: int) -> None:
+    """Save a lightweight manifest describing the embedded shard directory."""
+    summary = {
         "model": args.model,
         "dimensions": args.dimensions,
-        "count": len(chunks),
-        "chunks": chunks,
+        "batch_size": args.batch_size,
+        "delay_seconds": args.delay_seconds,
+        "max_retries": args.max_retries,
+        "checkpoint_every": args.checkpoint_every,
+        "embedded_in_this_run": embedded_now,
+        "shards": shard_statuses,
     }
-    path.write_text(json.dumps(output, indent=2), encoding="utf-8")
-    log.info(f"Checkpoint saved: {path} ({len(chunks)} chunks)")
+    save_manifest(output_root, summary)
 
 
 if __name__ == "__main__":
