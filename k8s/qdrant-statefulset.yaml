@@ -15,7 +15,19 @@ spec:
         app: qdrant
     spec:
       nodeSelector:
-        node: worker1
+        kubernetes.io/hostname: freya
+      initContainers:
+        - name: init-qdrant-permissions
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /qdrant/storage/snapshots && chown -R 1000:1000 /qdrant/storage
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
@@ -41,6 +53,8 @@ spec:
           env:
             - name: QDRANT__SERVICE__GRPC_PORT
               value: "6334"
+            - name: QDRANT__STORAGE__SNAPSHOTS_PATH
+              value: "/qdrant/storage/snapshots"
           livenessProbe:
             httpGet:
               path: /healthz

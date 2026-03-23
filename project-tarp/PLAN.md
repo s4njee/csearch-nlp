@@ -38,10 +38,10 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Supports `--clean` mode to remove previously saved error pages.
 - Falls back through XML → HTML → plain text formats per bill.
 
-### Step 2: The XML Parser & Chunker ✅ CODE COMPLETE (needs full run)
+### Step 2: The XML Parser & Chunker ✅ COMPLETE
 **Goal:** Parse bill text into semantically meaningful chunks with context prepended.
 **Script:** `chunker.py` (569 lines)
-**Status:** Tested on 20 bills → 432 chunks. Needs to be run on the full 7,789-bill dataset.
+**Status:** Full 110th Congress chunking run completed. Current production run with `--max-chunks-per-bill 300` produced 439,890 canonical chunks across 21 JSONL shards from 10,493 canonical bills. Dedup removed 11,571 duplicate sections; exact full-document dedup found 0 duplicate documents in this corpus.
 
 **Key implementation details:**
 - Deduplication happens before embedding and is part of the chunking pipeline, not a later storage concern.
@@ -58,12 +58,13 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Boilerplate filtering: skips sections titled "Short Title", "Effective Date", "Severability", "Table of Contents".
 - Token counting via `tiktoken` (`cl100k_base`), with word-count fallback if tiktoken is unavailable.
 - Sections exceeding `--max-tokens` (default 512) are split at `<subsection>` boundaries first, then force-split with `--overlap` (default 64) token overlap at sentence boundaries.
-- Per-bill chunk cap (`--max-chunks-per-bill`, default 200) keeps the meatiest chunks and drops the rest.
+- Per-bill chunk cap (`--max-chunks-per-bill`, default 200) is section-aware: it first keeps the strongest chunk from each section, then fills the remaining budget with the strongest leftover chunks bill-wide.
 - Filters out chunks below 30 tokens.
 - Outputs rolling JSONL shards under `./data/processed_chunks/{congress}/` rather than one monolithic JSON file. Each line is one canonical chunk record with dedup metadata. Each chunk should carry at minimum: `document_text_hash`, `section_text_hash` (when applicable), `canonical_bill_id`, and alias metadata describing which bills/sections map to that text.
 - Sharding is by canonical bill count with a soft chunk cap, not by bill type. This avoids giant `hr`/`s` shards while keeping all chunks for a canonical bill together.
 - Default shard policy: rotate after 500 canonical bills or 40,000 chunks, but only flush between canonical bills.
 - Each congress directory also gets a `manifest.json` with shard counts, chunk counts, and dedup summary stats.
+- After the per-bill cap is applied, surviving chunks are renumbered to contiguous `chunk_index` values within each canonical section; the pre-cap index is preserved as `original_chunk_index`.
 - Reports estimated embedding cost at the end of the run.
 
 **Deduplication data model:**
@@ -94,30 +95,30 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Canonical chunks currently use the highest-priority alias's bill prefix for embedding text and keep all other bill/status mappings in `document_aliases` and `section_aliases`. An alternative would be to embed a neutralized prefix-free body and add bill context only at retrieval time.
 - Dedup remains exact-match only. A future alternative is near-duplicate clustering for companion bills, but that should be treated as a retrieval/display optimization rather than a hard drop from the embedding corpus.
 - Shards are based on canonical bill count plus a soft chunk ceiling. An alternative is fixed-size chunk-only sharding, which balances file sizes more tightly but makes it easier to split one bill across shards.
+- The cap policy now preserves section coverage by keeping one best chunk per section before filling the remaining budget. An alternative is a pure top-token global cap, which is simpler but can erase small sections entirely.
 
-### Step 3: The Embedder ✅ CODE COMPLETE (not yet run)
+### Step 3: The Embedder ✅ COMPLETE
 **Goal:** Convert text chunks into 1536-dimensional vector arrays via OpenAI API.
 **Script:** `embedder.py` (204 lines)
-**Status:** Code complete. Waiting on the full chunker output before running (to avoid paying for a partial dataset).
+**Status:** Full embedding run completed against the sharded chunk output. The embedder now writes mirrored embedded JSONL shards under `./data/embedded_chunks/` with shard-local checkpointing and retry/backoff for rate limits.
 
 **Key implementation details:**
-- Reads `./data/processed_chunks/` recursively, loading all `shard-*.jsonl` files, then sends batches of 500 texts to `openai.embeddings.create()`.
-- Incremental: if `./data/embedded_chunks.json` already exists, only embeds chunks not already in the checkpoint. After dedup lands, checkpoint identity should be based on canonical chunk identity (`document_text_hash` + `section_text_hash` + `chunk_index`) rather than raw `bill_id` alone.
-- Checkpoint saves after each batch on error, so a failed run can resume without re-paying.
+- Reads `./data/processed_chunks/` recursively, loading all `shard-*.jsonl` files, then sends batches of texts to `openai.embeddings.create()`.
+- Writes embedded output as mirrored JSONL shards under `./data/embedded_chunks/` rather than one giant JSON checkpoint file. Example: `processed_chunks/110/shard-00003.jsonl` maps to `embedded_chunks/110/shard-00003.jsonl`.
+- Incremental: if an embedded shard already exists, only missing chunks in that shard are sent to the API. Checkpoint identity is based on canonical chunk identity (`document_text_hash` + `section_text_hash` + `chunk_index`) rather than raw `bill_id` alone.
+- Checkpoint saves are shard-local and periodic, so resume is cheap and does not require rewriting a monolithic file.
 - `--dry-run` flag shows cost estimate without calling the API.
-- Output format: `{"model": "...", "dimensions": 1536, "count": N, "chunks": [...]}` where each chunk has an `"embedding"` field containing the 1536-float vector.
+- Output format: one embedded chunk per JSONL line, with the original chunk metadata plus an `"embedding"` field containing the 1536-float vector. The embedded shard directory also gets a lightweight `manifest.json`.
 - Supports `--model` and `--dimensions` flags for experimenting with `text-embedding-3-large`.
 
-### Step 4: Storage Setup (Qdrant Upsert) — NOT STARTED
+### Step 4: Storage Setup (Qdrant Upsert) — IN PROGRESS
 **Goal:** Load the vectors and metadata into a local Qdrant instance.
-- Write a Python script (`upserter.py`).
-- Start Qdrant locally via Docker: `docker run -d -p 6333:6333 -v $(pwd)/data/qdrant_storage:/qdrant/storage qdrant/qdrant`
-- Use the `qdrant-client` library to connect to `localhost:6333`.
-- Create a collection named `bills_2008_test` with `size=1536` and `distance=Cosine`.
-- Create payload indexes: `congress` (integer), `type` (keyword), `bill_id` (keyword).
-- Read the checkpoint from `./data/embedded_chunks.json`.
-- Upsert vectors in batches (100–500 per call) with payload metadata: `bill_id`, `congress`, `type`, `number`, `short_title`, `section_enum`, `section_header`, `chunk_index`, and `text`.
-- Log progress and verify final collection point count matches chunk count.
+- `upserter.py` is implemented and reads embedded shard files from `./data/embedded_chunks/`.
+- Qdrant is deployed on the `mars` Kubernetes context in namespace `csearch-nlp` with a `LoadBalancer` service.
+- Current external endpoint: REST `http://192.168.1.156:6333`, gRPC `192.168.1.156:6334`.
+- The service is healthy (`/readyz` returns `all shards are ready`) and the `bill_chunks` collection is being populated now.
+- Upserts use deterministic UUID point IDs derived from canonical chunk identity so reruns are stable.
+- Payloads are intentionally lean by default; large alias arrays are omitted unless explicitly requested.
 
 ### Step 5: The Query Engine & Answer Generation — NOT STARTED
 **Goal:** Run semantic searches and generate readable answers using OpenAI's latest models.

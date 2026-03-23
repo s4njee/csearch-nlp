@@ -13,4 +13,4 @@ spec:
     - name: grpc
       port: 6334
       targetPort: 6334
-  type: ClusterIP
+  type: LoadBalancer
