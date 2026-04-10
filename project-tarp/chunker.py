@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "tiktoken",
+# ]
+# ///
+from __future__ import annotations
 """
 chunker.py — Parse downloaded bill text into semantically meaningful chunks.
 
@@ -628,6 +635,15 @@ def find_bill_dirs() -> list[Path]:
     return sorted(d for d in DATA_BASE.iterdir() if d.is_dir() and d.name.startswith("bills_"))
 
 
+def iter_meta_files(bills_dir: Path) -> list[Path]:
+    """Return bill metadata files, excluding hidden/macOS artifact files."""
+    return sorted(
+        path for path in bills_dir.rglob("*.meta.json")
+        if not any(part.startswith(".") for part in path.parts)
+        and not path.name.startswith("._")
+    )
+
+
 def apply_chunk_filters(chunks: list[dict], min_tokens: int, cap: int) -> tuple[list[dict], int, int]:
     """Apply global minimum-token and per-canonical-bill chunk cap filters."""
     before = len(chunks)
@@ -795,13 +811,17 @@ def write_congress_shards(
 
 def process_congress(bills_dir: Path, max_tokens: int, overlap: int, limit: int = 0) -> tuple[list[dict], dict]:
     """Process all downloaded bills in a congress directory."""
-    meta_files = sorted(bills_dir.rglob("*.meta.json"))
+    meta_files = iter_meta_files(bills_dir)
     if limit > 0:
         meta_files = meta_files[:limit]
 
     documents = []
     for mf in meta_files:
-        meta = json.loads(mf.read_text())
+        try:
+            meta = json.loads(mf.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            log.warning(f"Skipping unreadable metadata file {mf}: {exc}")
+            continue
         fmt = meta.get("format", "")
         stem = mf.stem.replace(".meta", "")
         parent = mf.parent

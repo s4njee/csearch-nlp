@@ -1,0 +1,9 @@
+.DS_Store
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.tar
+*.tar.zst
+bills.tar.zst
+data

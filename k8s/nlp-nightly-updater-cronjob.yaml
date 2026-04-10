@@ -1,0 +1,71 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tarp-nightly-updater
+  namespace: csearch-nlp
+spec:
+  # Run at 3 AM daily — after the @unitedstates/congress scraper CronJob.
+  # Adjust if the scraper runs later than midnight.
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 604800   # keep job pods for 7 days for log inspection
+      activeDeadlineSeconds: 21600      # kill if still running after 6 hours
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: freya
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          restartPolicy: OnFailure
+          imagePullSecrets:
+            - name: registry-s8njee-pull
+          containers:
+            - name: tarp-updater
+              image: registry.s8njee.com/csearch-tarp-updater:latest
+              imagePullPolicy: Always
+              env:
+                - name: CONGRESS
+                  value: "119"
+                - name: CONGRESS_DATA_ROOT
+                  value: /congress-data
+                - name: DATA_DIR
+                  value: /app/data
+                # OpenAI API key.
+                - name: OPENAI_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: csearch-nlp-secrets
+                      key: openai-api-key
+                # Postgres connection string.
+                - name: PG_CONNECTION_STRING
+                  valueFrom:
+                    secretKeyRef:
+                      name: csearch-nlp-secrets
+                      key: pg-connection-string
+              volumeMounts:
+                - name: tarp-data
+                  mountPath: /app/data
+                - name: congress-data
+                  mountPath: /congress-data
+                  readOnly: true
+              resources:
+                requests:
+                  memory: "2Gi"
+                  cpu: "500m"
+                limits:
+                  memory: "6Gi"
+                  cpu: "2"
+          volumes:
+            - name: tarp-data
+              persistentVolumeClaim:
+                claimName: tarp-data-pvc
+            - name: congress-data
+              persistentVolumeClaim:
+                claimName: congress-data-pvc

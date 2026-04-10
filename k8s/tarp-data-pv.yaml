@@ -1,0 +1,79 @@
+---
+# PersistentVolume for TARP working data:
+# fetched bill XMLs, processed chunks, embedded chunks, hash manifests, logs.
+# Stored on the freya node at /home/sanjee/nlp/tarp-data.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: tarp-data-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /home/sanjee/nlp/tarp-data
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - freya
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tarp-data-pvc
+  namespace: csearch-nlp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  volumeName: tarp-data-pv
+  resources:
+    requests:
+      storage: 100Gi
+---
+# PersistentVolume for the @unitedstates/congress scraper output (read-only).
+# The scraper CronJob writes here; the nightly updater reads from it.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: congress-data-pv
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /home/sanjee/congress/data
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - freya
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: congress-data-pvc
+  namespace: csearch-nlp
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: congress-data-pv
+  resources:
+    requests:
+      storage: 50Gi

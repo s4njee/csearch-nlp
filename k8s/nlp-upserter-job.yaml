@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: csearch-nlp-upserter
+  namespace: csearch-nlp
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: freya
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: upserter
+          image: docker.io/library/csearch-upserter:latest
+          imagePullPolicy: Never
+          args: ["--batch-size", "2000", "--skip-hnsw"]
+          env:
+            - name: PG_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: csearch-nlp-secrets
+                  key: pg-connection-string
+          volumeMounts:
+            - name: embedded-chunks
+              mountPath: /home/sanjee/nlp/embedded_chunks
+              readOnly: true
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "1"
+      volumes:
+        - name: embedded-chunks
+          hostPath:
+            path: /home/sanjee/nlp/embedded_chunks
+            type: Directory
+      restartPolicy: Never

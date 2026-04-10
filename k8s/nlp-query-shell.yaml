@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csearch-nlp-query-shell
+  namespace: csearch-nlp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csearch-nlp-query-shell
+  template:
+    metadata:
+      labels:
+        app: csearch-nlp-query-shell
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: freya
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: query-shell
+          image: docker.io/library/csearch-query-shell:latest
+          imagePullPolicy: Never
+          command: ["sh", "-lc", "sleep infinity"]
+          env:
+            - name: PG_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: csearch-nlp-secrets
+                  key: pg-connection-string
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: csearch-nlp-secrets
+                  key: openai-api-key
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"

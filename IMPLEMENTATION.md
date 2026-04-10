@@ -1,205 +1,226 @@
-# CSearch NLP — Detailed Implementation Steps
+# CSearch NLP Implementation
 
-This document houses the raw deployment configurations, K8s manifests, infrastructure templates, and Phase-by-Phase orchestration steps for the NLP Vector Database Pipeline. For a conceptual overview, please refer to `README.md`.
+This document translates the project plan into concrete infrastructure, schema, and rollout steps for a `pgvector`-backed implementation.
 
-## 1. Qdrant Deployment on Mars
+The main architectural change is simple: embeddings are no longer stored in Qdrant. They live in PostgreSQL via the `vector` extension.
 
-### Namespace
+## 1. PostgreSQL as the Vector Store
 
-```yaml
-# k8s/csearch-nlp/namespace.yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: csearch-nlp
+### Extension
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-### Persistent Volume (hostPath-backed SSD for Dev)
+This must be enabled in the target PostgreSQL database before any embedding tables are created.
 
-Because the development server (`mars`) uses local SSDs, we use `hostPath` to eliminate NFS overhead. Production deployment (`netcup`) storage will be evaluated separately.
+### Schema Layout
 
-```yaml
-# k8s/csearch-nlp/qdrant-pv.yaml
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: qdrant-pv
-spec:
-  capacity:
-    storage: 50Gi
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: standard
-  hostPath:
-    path: /mnt/data/qdrant
-    type: DirectoryOrCreate
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: qdrant-pvc
-  namespace: csearch-nlp
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 50Gi
+Recommended schema:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS nlp;
 ```
 
-### Full-text cache PV
+Recommended tables:
 
-```yaml
-# k8s/csearch-nlp/fulltext-pv.yaml
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: nlp-fulltext-pv
-spec:
-  capacity:
-    storage: 20Gi
-  accessModes:
-    - ReadWriteMany
-  storageClassName: standard
-  hostPath:
-    path: /mnt/data/nlp-fulltext
-    type: DirectoryOrCreate
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: nlp-fulltext-pvc
-  namespace: csearch-nlp
-spec:
-  accessModes:
-    - ReadWriteMany
-  resources:
-    requests:
-      storage: 20Gi
+```sql
+CREATE TABLE nlp.bill_chunks (
+  id BIGSERIAL PRIMARY KEY,
+  bill_id TEXT NOT NULL,
+  congress INTEGER NOT NULL,
+  bill_type TEXT NOT NULL,
+  bill_number TEXT NOT NULL,
+  chunk_type TEXT NOT NULL,
+  section_path TEXT,
+  title TEXT,
+  body TEXT NOT NULL,
+  token_count INTEGER NOT NULL,
+  source_version TEXT,
+  source_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE nlp.bill_embeddings (
+  chunk_id BIGINT PRIMARY KEY REFERENCES nlp.bill_chunks(id) ON DELETE CASCADE,
+  embedding vector(1536) NOT NULL,
+  model TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE nlp.sync_state (
+  bill_id TEXT PRIMARY KEY,
+  source_hash TEXT NOT NULL,
+  source_updated_at TIMESTAMPTZ,
+  last_chunked_at TIMESTAMPTZ,
+  last_embedded_at TIMESTAMPTZ,
+  last_loaded_at TIMESTAMPTZ,
+  status TEXT NOT NULL,
+  error_text TEXT
+);
 ```
 
-### Qdrant StatefulSet
+`embedding vector(1536)` is correct for OpenAI `text-embedding-3-small`. If this deployment switches to `Qwen3-Embedding-8B`, change the column to match the vector size you actually write:
 
-```yaml
-# k8s/csearch-nlp/qdrant-statefulset.yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: qdrant
-  namespace: csearch-nlp
-spec:
-  serviceName: qdrant
-  replicas: 1
-  selector:
-    matchLabels:
-      app: qdrant
-  template:
-    metadata:
-      labels:
-        app: qdrant
-    spec:
-      nodeSelector:
-        node: worker1
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
-      containers:
-        - name: qdrant
-          image: qdrant/qdrant:v1.12.1
-          ports:
-            - name: rest
-              containerPort: 6333
-            - name: grpc
-              containerPort: 6334
-          volumeMounts:
-            - name: qdrant-storage
-              mountPath: /qdrant/storage
-          resources:
-            requests:
-              memory: "1.5Gi"
-              cpu: "500m"
-            limits:
-              memory: "2Gi"
-              cpu: "1"
-          env:
-            - name: QDRANT__SERVICE__GRPC_PORT
-              value: "6334"
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 6333
-            initialDelaySeconds: 10
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 6333
-            initialDelaySeconds: 5
-            periodSeconds: 10
-      volumes:
-        - name: qdrant-storage
-          persistentVolumeClaim:
-            claimName: qdrant-pvc
+- `vector(4096)` for the default Qwen3 output
+- `vector(1024)` or another reduced size if you intentionally shorten vectors during local inference
+
+Do not mix dimensions in one table.
+
+Recommended supporting indexes:
+
+```sql
+CREATE INDEX bill_chunks_bill_id_idx ON nlp.bill_chunks (bill_id);
+CREATE INDEX bill_chunks_congress_idx ON nlp.bill_chunks (congress);
+CREATE INDEX bill_chunks_bill_type_idx ON nlp.bill_chunks (bill_type);
+CREATE INDEX bill_chunks_chunk_type_idx ON nlp.bill_chunks (chunk_type);
+CREATE INDEX bill_chunks_source_hash_idx ON nlp.bill_chunks (source_hash);
 ```
 
-### Qdrant Service
+### Vector Index
 
-```yaml
-# k8s/csearch-nlp/qdrant-service.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: qdrant
-  namespace: csearch-nlp
-spec:
-  selector:
-    app: qdrant
-  ports:
-    - name: rest
-      port: 6333
-      targetPort: 6333
-    - name: grpc
-      port: 6334
-      targetPort: 6334
-  type: ClusterIP
+Start with `hnsw` unless the dataset is too large for index build behavior or operational constraints:
+
+```sql
+CREATE INDEX bill_embeddings_embedding_hnsw_idx
+ON nlp.bill_embeddings
+USING hnsw (embedding vector_cosine_ops);
 ```
 
----
+If build time or memory pressure becomes a problem, fall back to `ivfflat`:
 
-## 2. NLP API Deployment on Mars
-
-### Secrets
-
-```yaml
-# k8s/csearch-nlp/secrets.yaml (template — apply manually, do not commit real values)
-apiVersion: v1
-kind: Secret
-metadata:
-  name: csearch-nlp-secrets
-  namespace: csearch-nlp
-type: Opaque
-stringData:
-  pg-connection-string: "postgresql://postgres:postgres@postgres-service.default.svc.cluster.local:5432/csearch"
-  embedding-api-key: "ollama-local"
-  llm-api-key: "ollama-local"
+```sql
+CREATE INDEX bill_embeddings_embedding_ivfflat_idx
+ON nlp.bill_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
 ```
 
-### ConfigMap
+Use one ANN strategy first. Do not maintain both unless benchmarking proves you need them.
+
+## 2. Query Pattern
+
+The basic semantic retrieval query should look like this:
+
+```sql
+SELECT
+  c.id,
+  c.bill_id,
+  c.chunk_type,
+  c.title,
+  c.body,
+  1 - (e.embedding <=> $1::vector) AS similarity
+FROM nlp.bill_embeddings e
+JOIN nlp.bill_chunks c ON c.id = e.chunk_id
+WHERE c.congress BETWEEN $2 AND $3
+ORDER BY e.embedding <=> $1::vector
+LIMIT 40;
+```
+
+Important points:
+
+- Use cosine distance consistently at ingest and query time.
+- Apply structured filters before `LIMIT` where possible.
+- Keep chunk metadata on the chunk row, not inside a JSON payload, so SQL filters stay simple and indexable.
+
+## 3. Hybrid Retrieval
+
+The retrieval service should execute two searches in parallel:
+
+### Vector Search
+
+- embed query with the same model used at ingest time
+- search `nlp.bill_embeddings`
+- return top `k` chunk candidates plus similarity scores
+
+### Keyword Search
+
+- search existing CSearch bill metadata with `tsvector`
+- return top keyword-matched bills
+
+### Fusion
+
+- convert both result sets into ranked lists
+- merge with Reciprocal Rank Fusion
+- rerank the fused top candidates with a cross-encoder
+
+The final user-facing unit can still be a bill, even though the vector retrieval unit is a chunk.
+
+## 4. Ingestion Pipeline
+
+The current proof-of-concept scripts in `project-tarp/` already cover fetch, chunk, and embedding well enough to inform the production pipeline. The change required is at the load stage.
+
+### Fetch
+
+- download bill text from GovInfo
+- keep a local raw cache
+- prefer the highest-value available bill version
+
+### Chunk
+
+- preserve section boundaries where possible
+- strip boilerplate
+- deduplicate exact repeated text before embedding
+- emit stable chunk identifiers derived from bill/version/section content
+
+### Embed
+
+- batch through one embedding backend consistently for both corpus and queries
+- if using OpenAI, `text-embedding-3-small` is the lower-cost hosted default
+- if using a local GPU, `Qwen3-Embedding-8B` is the highest-quality open-weight default
+- checkpoint progress by shard or batch, not one monolithic JSON file
+- write intermediate outputs to local disk only as long as needed for restart safety
+
+### Load
+
+Load in two phases:
+
+1. bulk insert `nlp.bill_chunks`
+2. bulk insert `nlp.bill_embeddings`
+
+Preferred approach:
+
+- stage rows into temp tables or unlogged tables
+- merge into target tables in SQL
+- update `nlp.sync_state` only after successful commit
+
+Do not insert row-by-row through the application if you can avoid it. Use PostgreSQL bulk loading.
+
+## 5. Suggested Loader Workflow
+
+Recommended transactional flow for one bill:
+
+1. compute source hash
+2. compare against `nlp.sync_state`
+3. if unchanged, skip
+4. if changed, delete existing rows for that bill
+5. insert fresh chunk rows
+6. insert fresh embedding rows
+7. update sync state
+8. commit
+
+This is simpler and safer than attempting fine-grained partial mutation on the first version.
+
+## 6. API Configuration
+
+The application config should move away from Qdrant-specific variables.
+
+Example `ConfigMap` values:
 
 ```yaml
-# k8s/csearch-nlp/configmap.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: csearch-nlp-config
   namespace: csearch-nlp
 data:
-  QDRANT_HOST: "qdrant.csearch-nlp.svc.cluster.local"
-  QDRANT_PORT: "6333"
-  QDRANT_COLLECTION: "bill_chunks"
-  EMBEDDING_MODEL: "nomic-embed-text"
-  LLM_MODEL: "qwen2.5:7b"
+  PG_CONNECTION_STRING: "postgresql://csearch_readonly:password@postgres-service.default.svc.cluster.local:5432/csearch"
+  EMBEDDING_BACKEND: "ollama"
+  EMBEDDING_MODEL: "qwen3-embedding:8b-q8_0"
+  EMBEDDING_BASE_URL: "http://ollama.default.svc.cluster.local:11434"
+  EMBEDDING_DIMENSIONS: "4096"
+  EMBEDDING_QUERY_PROMPT: "Represent this query for retrieving relevant legislative passages:"
+  LLM_MODEL: "gpt-5.4-nano"
   RAG_VECTOR_TOP_K: "40"
   RAG_RERANK_TOP_K: "10"
   RAG_SCORE_THRESHOLD: "0.35"
@@ -208,334 +229,269 @@ data:
   CACHE_EMBEDDING_TTL: "86400"
   CACHE_SEARCH_TTL: "3600"
   CACHE_LLM_TTL: "3600"
-  FULLTEXT_CACHE_DIR: "/data/fulltext"
   GOVINFO_RATE_LIMIT: "10"
 ```
 
-### API Deployment
+Example secret values:
 
 ```yaml
-# k8s/csearch-nlp/nlp-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: csearch-nlp-api
-  namespace: csearch-nlp
-spec:
-  replicas: 1                    # single replica on 4CPU/8GB VPS
-  selector:
-    matchLabels:
-      app: csearch-nlp-api
-  template:
-    metadata:
-      labels:
-        app: csearch-nlp-api
-    spec:
-      nodeSelector:
-        node: worker1
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-      containers:
-        - name: api
-          image: 10.0.0.3:30252/csearch-nlp:latest
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8000
-          envFrom:
-            - configMapRef:
-                name: csearch-nlp-config
-          env:
-            - name: PG_CONNECTION_STRING
-              valueFrom:
-                secretKeyRef:
-                  name: csearch-nlp-secrets
-                  key: pg-connection-string
-            - name: EMBEDDING_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: csearch-nlp-secrets
-                  key: embedding-api-key
-            - name: LLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: csearch-nlp-secrets
-                  key: llm-api-key
-          volumeMounts:
-            - name: fulltext-cache
-              mountPath: /data/fulltext
-          resources:
-            requests:
-              memory: "1Gi"
-              cpu: "500m"
-            limits:
-              memory: "2Gi"
-              cpu: "1"
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 10
-      volumes:
-        - name: fulltext-cache
-          persistentVolumeClaim:
-            claimName: nlp-fulltext-pvc
-```
-
-### API Service
-
-```yaml
-# k8s/csearch-nlp/nlp-service.yaml
 apiVersion: v1
-kind: Service
+kind: Secret
 metadata:
-  name: csearch-nlp-api
+  name: csearch-nlp-secrets
   namespace: csearch-nlp
-spec:
-  selector:
-    app: csearch-nlp-api
-  ports:
-    - port: 8000
-      targetPort: 8000
-  type: ClusterIP
+type: Opaque
+stringData:
+  pg-connection-string: "postgresql://csearch_nlp_writer:strong-pass@postgres-service.default.svc.cluster.local:5432/csearch"
+  openai-api-key: "replace-me-if-using-openai"
 ```
 
-### Nightly Sync CronJob
+If OpenAI remains the embedding provider, change the embedding settings accordingly:
 
 ```yaml
-# k8s/csearch-nlp/nlp-sync-cronjob.yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: csearch-nlp-sync
-  namespace: csearch-nlp
-spec:
-  schedule: "30 0 * * *"          # 00:30 daily, after goscraper finishes at midnight
-  concurrencyPolicy: Forbid
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          nodeSelector:
-            node: worker1
-          securityContext:
-            runAsUser: 1000
-            runAsGroup: 1000
-          containers:
-            - name: nlp-sync
-              image: 10.0.0.3:30252/csearch-nlp:latest
-              imagePullPolicy: Always
-              command: ["python", "-m", "csearch_nlp.pipeline", "sync"]
-              envFrom:
-                - configMapRef:
-                    name: csearch-nlp-config
-              env:
-                - name: PG_CONNECTION_STRING
-                  valueFrom:
-                    secretKeyRef:
-                      name: csearch-nlp-secrets
-                      key: pg-connection-string
-                - name: EMBEDDING_API_KEY
-                  valueFrom:
-                    secretKeyRef:
-                      name: csearch-nlp-secrets
-                      key: embedding-api-key
-              volumeMounts:
-                - name: fulltext-cache
-                  mountPath: /data/fulltext
-              resources:
-                requests:
-                  memory: "512Mi"
-                  cpu: "250m"
-                limits:
-                  memory: "1Gi"
-                  cpu: "500m"
-          volumes:
-            - name: fulltext-cache
-              persistentVolumeClaim:
-                claimName: nlp-fulltext-pvc
-          restartPolicy: OnFailure
+data:
+  EMBEDDING_BACKEND: "openai"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  EMBEDDING_DIMENSIONS: "1536"
+  EMBEDDING_BASE_URL: ""
+  EMBEDDING_QUERY_PROMPT: ""
 ```
 
----
+## 7. Local Embedding on an RTX 3090
 
-## 3. Project File Structure
+An RTX 3090 is a reasonable target for local `Qwen3-Embedding-8B` inference. For this project, the most practical local options are:
+
+- `Ollama` for the quickest operational path
+- `sentence-transformers` or `vLLM` if you need tighter control over prompts, batching, or output dimensions
+
+Recommended default for a 3090:
+
+- start with `qwen3-embedding:8b-q8_0` in Ollama
+- keep the PostgreSQL column at `vector(4096)` unless storage pressure forces you to shorten vectors later
+- use cosine similarity only
+- embed document chunks without a query prefix
+- embed search queries with a retrieval-oriented prefix
+
+### Option A: Ollama
+
+Install and start Ollama on the GPU host, then pull the model:
+
+```bash
+ollama pull qwen3-embedding:8b-q8_0
+```
+
+Smoke test the local daemon:
+
+```bash
+curl http://localhost:11434/api/embed \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-embedding:8b-q8_0",
+    "input": "Clean Water Act section 402 permitting requirements"
+  }'
+```
+
+Batch embedding example in Python:
+
+```python
+import ollama
+
+QUERY_PREFIX = "Represent this query for retrieving relevant legislative passages: "
+
+def embed_documents(texts: list[str]) -> list[list[float]]:
+    response = ollama.embed(
+        model="qwen3-embedding:8b-q8_0",
+        input=texts,
+    )
+    return response["embeddings"]
+
+def embed_queries(texts: list[str]) -> list[list[float]]:
+    response = ollama.embed(
+        model="qwen3-embedding:8b-q8_0",
+        input=[QUERY_PREFIX + text for text in texts],
+    )
+    return response["embeddings"]
+```
+
+Operational notes for Ollama:
+
+- verify the returned vector length once and make the PostgreSQL column match it exactly
+- keep the same model tag for both indexing and query embedding
+- if you later change quantization or dimensions, rebuild the embeddings table rather than mixing vectors
+
+### Option B: Direct Hugging Face Inference
+
+Use this path if you want the official prompt handling and optional dimension shortening in one process.
+
+Install the minimum packages:
+
+```bash
+pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" torch
+```
+
+Example:
+
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer(
+    "Qwen/Qwen3-Embedding-8B",
+    model_kwargs={"attn_implementation": "flash_attention_2", "device_map": "auto"},
+    tokenizer_kwargs={"padding_side": "left"},
+)
+
+doc_embeddings = model.encode(
+    document_texts,
+    normalize_embeddings=True,
+)
+
+query_embeddings = model.encode(
+    query_texts,
+    prompt_name="query",
+    normalize_embeddings=True,
+)
+```
+
+This path is easier to extend if you later need custom prompt handling, larger batches, or your own vector post-processing before writing into `pgvector`.
+
+### Pipeline Changes Required
+
+To switch the project from hosted OpenAI embeddings to local Qwen3 embeddings:
+
+1. update the schema so `nlp.bill_embeddings.embedding` matches the chosen Qwen3 dimension
+2. replace the embedding client in both ingest and query paths with one local backend
+3. apply the same query prefix strategy every time a search query is embedded
+4. re-embed the full corpus once, then rebuild the ANN index
+5. keep the reranker and answer-generation path independent from the embedding provider
+
+## 8. Kubernetes Footprint
+
+With `pgvector`, the deployment is smaller than the old Qdrant plan.
+
+You still need:
+
+- namespace
+- API deployment
+- Redis connectivity
+- secrets/configmaps
+- optional PVC for cached raw full text
+- optional CronJob for nightly sync
+
+You do not need:
+
+- Qdrant StatefulSet
+- Qdrant service
+- Qdrant PV/PVC
+- Qdrant collection bootstrap step
+
+That simplification is the main operational win of the migration.
+
+## 9. Nightly Sync
+
+The sync job should:
+
+1. query for new or updated bills
+2. fetch current source text
+3. re-chunk changed bills
+4. embed changed chunks
+5. replace rows in PostgreSQL
+6. update sync state
+
+Example CronJob command:
+
+```yaml
+args:
+  - python
+  - -m
+  - csearch_nlp.pipeline.sync
+```
+
+Keep the job idempotent. If it fails halfway through, re-running it should converge cleanly without manual cleanup.
+
+## 10. Operational Notes
+
+### PostgreSQL Tuning
+
+Moving vectors into PostgreSQL makes database tuning more important than before. At minimum, evaluate:
+
+- `shared_buffers`
+- `work_mem`
+- `maintenance_work_mem`
+- autovacuum thresholds on `nlp` tables
+- index build timing and concurrency
+
+### Re-Embedding Strategy
+
+Because embeddings are isolated in `nlp.bill_embeddings`, model migrations are straightforward:
+
+- keep chunk text stable
+- create a new embeddings table or a new `model` partition
+- backfill vectors
+- switch retrieval to the new model once validated
+
+Do not overwrite the only embeddings copy during a model migration.
+
+### Backup Strategy
+
+Backups now come from PostgreSQL backups rather than a separate Qdrant snapshot flow. That is operationally simpler, but it also means the database backup policy now covers both transactional and vector data.
+
+## 11. Rollout Sequence
+
+Recommended rollout order:
+
+1. enable `pgvector` in a development database
+2. create `nlp` schema and tables
+3. load a small sample corpus from `project-tarp/`
+4. benchmark vector search latency and recall
+5. wire up hybrid retrieval in the API
+6. add reranking and answer generation
+7. add scheduled incremental sync
+8. only then scale corpus size
+
+## 12. Files and Modules
+
+Suggested project layout after the migration:
 
 ```text
-csearch-nlp/
-├── pyproject.toml
-├── Dockerfile
-├── docker-compose.yml              # Local dev: Qdrant + Redis + API
-│
-├── csearch_nlp/
-│   ├── __init__.py
-│   ├── config.py                   # Env vars, model names, thresholds
-│   │
-│   ├── api/
-│   │   ├── server.py               # FastAPI app
-│   │   ├── routes.py               # POST /api/nlp/search, GET /health
-│   │   └── models.py               # Pydantic request/response schemas
-│   │
-│   ├── rag/
-│   │   ├── orchestrator.py         # Main pipeline
-│   │   ├── query_classifier.py     # Filter extraction, intent classification
-│   │   ├── embedder.py             # Embedding API wrapper
-│   │   ├── retriever.py            # Qdrant + PG keyword search
-│   │   ├── reranker.py             # Cross-encoder
-│   │   ├── fusion.py               # Reciprocal Rank Fusion
-│   │   ├── hydrator.py             # PG bill metadata fetch
-│   │   ├── prompt_builder.py       # LLM prompt construction
-│   │   └── generator.py            # Claude streaming client
-│   │
-│   ├── pipeline/
-│   │   ├── __main__.py             # CLI: batch / sync / reembed
-│   │   ├── fetcher.py              # GovInfo XML downloader
-│   │   ├── chunker.py              # XML-aware section splitter
-│   │   ├── batcher.py              # Embedding API batcher
-│   │   ├── upserter.py             # Qdrant upsert
-│   │   └── tracker.py              # Sync state (which bills are embedded)
-│   │
-│   └── cache/
-│       └── redis_cache.py
-│
-├── k8s/
-│   ├── namespace.yaml
-│   ├── qdrant-pv.yaml
-│   ├── qdrant-statefulset.yaml
-│   ├── qdrant-service.yaml
-│   ├── fulltext-pv.yaml
-│   ├── nlp-deployment.yaml
-│   ├── nlp-service.yaml
-│   ├── nlp-sync-cronjob.yaml
-│   ├── configmap.yaml
-│   └── secrets.yaml                # Template only
-│
-└── tests/
-    ├── test_chunker.py
-    ├── test_retriever.py
-    ├── test_fusion.py
-    └── eval/
-        ├── eval_queries.json       # 100+ queries with expected bills
-        └── run_eval.py             # recall@10, MRR
+csearch_nlp/
+  api/
+    server.py
+    routes.py
+    models.py
+  rag/
+    query_classifier.py
+    embedder.py
+    retriever.py
+    fusion.py
+    reranker.py
+    hydrator.py
+    prompt_builder.py
+    generator.py
+  pipeline/
+    fetcher.py
+    chunker.py
+    embedder.py
+    loader.py
+    tracker.py
+    sync.py
+  db/
+    migrations/
+    queries/
+  cache/
+    redis_cache.py
 ```
 
----
+The key difference from the older design is `loader.py` and SQL migrations replace the Qdrant upsert layer.
 
-## 4. Phase-by-Phase Execution
+## 13. Current Implication for Existing POC Code
 
-### Phase 0 — Bootstrap (Day 1)
+`project-tarp/` still contains Qdrant-oriented proof-of-concept tooling. That is acceptable as historical prototype code, but it should not be treated as the storage design for the main system anymore.
 
-These are one-time manual steps for the `mars` dev cluster before ArgoCD takes over.
+When promoting code from the prototype:
 
-```bash
-# 1. Prepare dev SSD paths (HostPath storage)
-mkdir -p /mnt/data/qdrant
-mkdir -p /mnt/data/nlp-fulltext
-chown 1000:1000 /mnt/data/qdrant /mnt/data/nlp-fulltext
+- keep fetch logic
+- keep chunking logic
+- keep embedding logic
+- replace Qdrant-specific load and query layers with PostgreSQL implementations
 
-# 2. Create the standalone csearch-nlp repo
-cd ~/Documents/projects/
-mkdir csearch-nlp && cd csearch-nlp
-git init
-
-# 3. Create read-only PostgreSQL role
-# Replace with your actual Postgres superuser connection string or exec into pod:
-kubectl --context mars exec -it svc/postgres-service -- psql -U postgres -d csearch -c "
-CREATE ROLE csearch_readonly WITH LOGIN PASSWORD 'strong-pass';
-GRANT CONNECT ON DATABASE csearch TO csearch_readonly;
-GRANT USAGE ON SCHEMA public TO csearch_readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO csearch_readonly;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO csearch_readonly;
-"
-
-# 4. Apply the ArgoCD Application resource (pointing to the new csearch-nlp repo)
-kubectl --context mars apply -f argo/applications/csearch-nlp.yaml
-argocd app wait csearch-nlp
-
-# 5. Create secrets (not in git)
-# For local Ollama dev, the LLM / Embedding API keys can be dummy values
-kubectl --context mars create secret generic csearch-nlp-secrets \
-  -n csearch-nlp \
-  --from-literal=pg-connection-string="postgresql://csearch_readonly:strong-pass@postgres-service.default.svc.cluster.local:5432/csearch" \
-  --from-literal=embedding-api-key="ollama-local" \
-  --from-literal=llm-api-key="ollama-local"
-
-kubectl --context mars label secret csearch-nlp-secrets \
-  -n csearch-nlp \
-  argocd.argoproj.io/managed-by=manual
-
-# 6. Verify Qdrant is running and create the collection
-kubectl --context mars -n csearch-nlp get pods
-kubectl --context mars port-forward svc/qdrant 6333:6333 -n csearch-nlp
-```
-
-### Phase 1 — Data pipeline (Week 1–2)
-
-Build the Python pipeline in the new `csearch-nlp` repository, using **local Ollama embeddings (nomic-embed-text or mxbai-embed-large)** and integrating both bills and votes (~10M chunks).
-
-```bash
-# 1. Point the pipeline to your local Ollama instance (GPU 3090)
-export OLLAMA_HOST="http://localhost:11434"
-export EMBEDDING_MODEL="nomic-embed-text"
-
-# 2. Fetch full bill + vote data
-python -m csearch_nlp.pipeline fetch --congress-range 93-118 --include-votes
-
-# 3. Chunk the XML & JSON
-python -m csearch_nlp.pipeline chunk --congress-range 93-118 --skip-boilerplate --include-votes
-
-# 4. Embed and push to Qdrant using Local GPU
-kubectl --context mars port-forward svc/qdrant 6333:6333 -n csearch-nlp &
-python -m csearch_nlp.pipeline batch \
-  --workers 4 \
-  --congress-range 93-118 \
-  --batch-size 100 \
-  --use-ollama
-
-# 5. Verify
-python -c "
-from qdrant_client import QdrantClient
-c = QdrantClient('localhost', port=6333)
-print(c.get_collection('bill_chunks'))
-print(c.get_collection('vote_chunks'))
-"
-# Expect ~10M points
-```
-
-### Phase 2 — API service (Week 2–3)
-
-```bash
-# 1. Build and push the Docker image
-docker build -t 10.0.0.3:30252/csearch-nlp:v0.1.0 .
-docker push 10.0.0.3:30252/csearch-nlp:v0.1.0
-
-# 2. Update k8s/nlp-deployment.yaml with the image tag
-# 3. Commit and push — ArgoCD deploys automatically
-
-# 4. Test via port-forward
-kubectl --context mars port-forward svc/csearch-nlp-api 8000:8000 -n csearch-nlp
-
-curl -X POST http://localhost:8000/api/nlp/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "bills about banning stock trading by members of Congress"}'
-```
-
-### Phase 3 — Nightly sync (Week 3)
-
-The CronJob is already deployed by ArgoCD (from `k8s/nlp-sync-cronjob.yaml`). Test it manually:
-
-```bash
-kubectl --context mars create job --from=cronjob/csearch-nlp-sync test-sync -n csearch-nlp
-kubectl --context mars -n csearch-nlp logs job/test-sync -f
-```
-
-### Phase 4 — Frontend integration (Week 4)
-
-The API is accessible within the cluster at `csearch-nlp-api.csearch-nlp.svc.cluster.local:8000`. Wire it into the CSearch Nuxt frontend or have the Fastify backend proxy to it.
+That boundary should stay explicit so the repository does not drift into supporting two vector stores by accident.

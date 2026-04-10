@@ -11,9 +11,9 @@ Last updated: 2026-03-23
 | `fetcher.py` | ✅ Complete | 7,960 bills discovered, 7,789 XML files downloaded |
 | `chunker.py` | ✅ Complete | Full Congress 110 run completed; 439,890 chunks across 21 shards with section dedup enabled |
 | `embedder.py` | ✅ Complete | Full embedding run completed to sharded output under `data/embedded_chunks/` |
-| `upserter.py` | 🟡 In progress | Implemented; currently upserting embedded shards into Qdrant |
+| `upserter.py` | 🟡 In progress | Implemented; currently loading embedded shards into PostgreSQL `pgvector` |
 | `query.py` | ❌ Not started | Needs to be written |
-| Qdrant | 🟡 Running | Deployed on `mars` in namespace `csearch-nlp` via LoadBalancer at `192.168.1.156:6333` |
+| PostgreSQL `pgvector` | 🟡 Running | Loads embedded shards into `nlp.bill_chunks` and `nlp.bill_embeddings` |
 | OpenAI API key | ✅ Set | Used for the completed embedding run |
 
 ---
@@ -98,19 +98,14 @@ Embedding is complete and now writes mirrored JSONL shards under `data/embedded_
 
 ---
 
-## Phase 4: Qdrant Setup & Upsert 🟡 IN PROGRESS
+## Phase 4: PostgreSQL Setup & Upsert 🟡 IN PROGRESS
 
-- [x] **Deploy Qdrant on `mars` Kubernetes**
-  - Namespace: `csearch-nlp`
-  - Service type: `LoadBalancer`
-  - External REST endpoint: `http://192.168.1.156:6333`
-  - External gRPC endpoint: `192.168.1.156:6334`
 - [x] **Write `upserter.py`**
   - Reads `data/embedded_chunks/`
-  - Uses deterministic UUID point IDs
-  - Defaults to Qdrant host `192.168.1.156:6333`
-  - Targets collection `bill_chunks`
-  - Keeps payloads lean by default
+  - Loads rows into PostgreSQL `nlp.bill_chunks` and `nlp.bill_embeddings`
+  - Uses a staging table plus transactional replacement per shard
+  - Defaults to `PG_CONNECTION_STRING` from the environment
+  - Keeps optional aliases out of storage unless requested
 - [ ] **Run the upserter**
   ```bash
   cd project-tarp
@@ -118,13 +113,10 @@ Embedding is complete and now writes mirrored JSONL shards under `data/embedded_
   ```
 - [ ] **Verify collection health after ingestion completes**
   ```bash
-  python3 -c "
-  from qdrant_client import QdrantClient
-  c = QdrantClient('192.168.1.156', port=6333)
-  info = c.get_collection('bill_chunks')
-  print(f'Points: {info.points_count}')
-  print(f'Vectors: {info.vectors_count}')
-  print(f'Status: {info.status}')
+  psql "$PG_CONNECTION_STRING" -c "
+  SELECT
+    (SELECT count(*) FROM nlp.bill_chunks) AS chunks,
+    (SELECT count(*) FROM nlp.bill_embeddings) AS embeddings;
   "
   ```
 
@@ -161,7 +153,7 @@ Embedding is complete and now writes mirrored JSONL shards under `data/embedded_
   ```
   openai
   tiktoken
-  qdrant-client
+  psycopg2-binary
   ```
 - [x] **Update `PLAN.md`** with actual results (chunk counts, cost, quality observations)
 - [ ] **Write findings** — what worked, what didn't, what to change before scaling to all 50 years
