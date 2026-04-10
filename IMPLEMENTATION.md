@@ -1,8 +1,6 @@
 # CSearch NLP Implementation
 
-This document translates the project plan into concrete infrastructure, schema, and rollout steps for a `pgvector`-backed implementation.
-
-The main architectural change is simple: embeddings are no longer stored in Qdrant. They live in PostgreSQL via the `vector` extension.
+Architecture: embeddings live in PostgreSQL via the `pgvector` extension. The ingestion pipeline (`project-tarp/`) is operational. This document covers the schema, query patterns, and remaining API work.
 
 ## 1. PostgreSQL as the Vector Store
 
@@ -60,12 +58,7 @@ CREATE TABLE nlp.sync_state (
 );
 ```
 
-`embedding vector(1536)` is correct for OpenAI `text-embedding-3-small`. If this deployment switches to `Qwen3-Embedding-8B`, change the column to match the vector size you actually write:
-
-- `vector(4096)` for the default Qwen3 output
-- `vector(1024)` or another reduced size if you intentionally shorten vectors during local inference
-
-Do not mix dimensions in one table.
+`embedding vector(1536)` matches OpenAI `text-embedding-3-small`, which is the current embedding provider. Do not mix dimensions in one table.
 
 Recommended supporting indexes:
 
@@ -123,7 +116,118 @@ Important points:
 - Apply structured filters before `LIMIT` where possible.
 - Keep chunk metadata on the chunk row, not inside a JSON payload, so SQL filters stay simple and indexable.
 
-## 3. Hybrid Retrieval
+## 3. Semantic Search API Route
+
+This section describes the single concrete route Codex should implement first. The goal is a FastAPI endpoint that embeds an incoming query with OpenAI and returns the 20 most similar bills from `nlp.bill_embeddings`.
+
+### Endpoint
+
+```
+POST /api/search/semantic
+```
+
+### Request model
+
+```python
+class SemanticSearchRequest(BaseModel):
+    query: str
+    congress_min: int | None = None   # optional congress filter
+    congress_max: int | None = None
+```
+
+### Response model
+
+Return one record per **bill** (not per chunk). Where a bill produces multiple chunk hits, keep only the highest-scoring chunk.
+
+```python
+class BillResult(BaseModel):
+    bill_id: str
+    congress: int
+    bill_type: str
+    bill_number: str
+    title: str | None
+    body: str           # the best-matching chunk body, for context
+    chunk_type: str
+    similarity: float
+
+class SemanticSearchResponse(BaseModel):
+    results: list[BillResult]
+```
+
+### Implementation steps
+
+**1. Embed the query with OpenAI**
+
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()   # reads OPENAI_API_KEY from env
+
+async def embed_query(text: str) -> list[float]:
+    resp = await client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return resp.data[0].embedding
+```
+
+**2. Query pgvector**
+
+Use cosine distance (`<=>`). Return the top 40 chunk candidates, then deduplicate to 20 unique bills in Python — this is simpler than a `DISTINCT ON` approach and lets you see the best chunk per bill.
+
+```sql
+SELECT
+  c.bill_id,
+  c.congress,
+  c.bill_type,
+  c.bill_number,
+  c.title,
+  c.body,
+  c.chunk_type,
+  1 - (e.embedding <=> $1::vector) AS similarity
+FROM nlp.bill_embeddings e
+JOIN nlp.bill_chunks c ON c.id = e.chunk_id
+WHERE
+  ($2::int IS NULL OR c.congress >= $2)
+  AND ($3::int IS NULL OR c.congress <= $3)
+ORDER BY e.embedding <=> $1::vector
+LIMIT 40;
+```
+
+Parameters: `$1` = embedding vector, `$2` = `congress_min`, `$3` = `congress_max`.
+
+**3. Deduplicate to 20 bills**
+
+```python
+seen: dict[str, BillResult] = {}
+for row in rows:
+    if row["bill_id"] not in seen:
+        seen[row["bill_id"]] = BillResult(**row)
+    if len(seen) == 20:
+        break
+results = list(seen.values())
+```
+
+**4. Wire up the route**
+
+```python
+@router.post("/api/search/semantic", response_model=SemanticSearchResponse)
+async def semantic_search(body: SemanticSearchRequest, db: AsyncConnection = Depends(get_db)):
+    vector = await embed_query(body.query)
+    rows = await db.fetch(SEMANTIC_SEARCH_SQL, vector, body.congress_min, body.congress_max)
+    results = deduplicate_to_bills(rows, limit=20)
+    return SemanticSearchResponse(results=results)
+```
+
+### Notes for Codex
+
+- The embedding column is `vector(1536)` — `text-embedding-3-small` output. Do not change the dimension.
+- Use `asyncpg` for the database connection; it handles `vector` columns as plain Python lists of floats when passed as parameters. Cast explicitly in the SQL (`$1::vector`) to be safe.
+- `OPENAI_API_KEY` is injected from the `csearch-nlp-secrets` Secret in k8s; read it from env — do not hardcode.
+- Keep the embedding call and the DB query independent so each can be tested separately.
+- Do not add reranking or hybrid fusion to this route yet — that is section 4 (Hybrid Retrieval) and comes later.
+
+## 4. Hybrid Retrieval
 
 The retrieval service should execute two searches in parallel:
 
@@ -146,7 +250,7 @@ The retrieval service should execute two searches in parallel:
 
 The final user-facing unit can still be a bill, even though the vector retrieval unit is a chunk.
 
-## 4. Ingestion Pipeline
+## 5. Ingestion Pipeline
 
 The current proof-of-concept scripts in `project-tarp/` already cover fetch, chunk, and embedding well enough to inform the production pipeline. The change required is at the load stage.
 
@@ -165,9 +269,7 @@ The current proof-of-concept scripts in `project-tarp/` already cover fetch, chu
 
 ### Embed
 
-- batch through one embedding backend consistently for both corpus and queries
-- if using OpenAI, `text-embedding-3-small` is the lower-cost hosted default
-- if using a local GPU, `Qwen3-Embedding-8B` is the highest-quality open-weight default
+- batch through OpenAI `text-embedding-3-small` consistently for both corpus and queries
 - checkpoint progress by shard or batch, not one monolithic JSON file
 - write intermediate outputs to local disk only as long as needed for restart safety
 
@@ -186,7 +288,7 @@ Preferred approach:
 
 Do not insert row-by-row through the application if you can avoid it. Use PostgreSQL bulk loading.
 
-## 5. Suggested Loader Workflow
+## 6. Suggested Loader Workflow
 
 Recommended transactional flow for one bill:
 
@@ -201,9 +303,7 @@ Recommended transactional flow for one bill:
 
 This is simpler and safer than attempting fine-grained partial mutation on the first version.
 
-## 6. API Configuration
-
-The application config should move away from Qdrant-specific variables.
+## 7. API Configuration
 
 Example `ConfigMap` values:
 
@@ -215,21 +315,9 @@ metadata:
   namespace: csearch-nlp
 data:
   PG_CONNECTION_STRING: "postgresql://csearch_readonly:password@postgres-service.default.svc.cluster.local:5432/csearch"
-  EMBEDDING_BACKEND: "ollama"
-  EMBEDDING_MODEL: "qwen3-embedding:8b-q8_0"
-  EMBEDDING_BASE_URL: "http://ollama.default.svc.cluster.local:11434"
-  EMBEDDING_DIMENSIONS: "4096"
-  EMBEDDING_QUERY_PROMPT: "Represent this query for retrieving relevant legislative passages:"
-  LLM_MODEL: "gpt-5.4-nano"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  EMBEDDING_DIMENSIONS: "1536"
   RAG_VECTOR_TOP_K: "40"
-  RAG_RERANK_TOP_K: "10"
-  RAG_SCORE_THRESHOLD: "0.35"
-  RRF_K: "60"
-  REDIS_URL: "redis://redis-service.default.svc.cluster.local:6379/1"
-  CACHE_EMBEDDING_TTL: "86400"
-  CACHE_SEARCH_TTL: "3600"
-  CACHE_LLM_TTL: "3600"
-  GOVINFO_RATE_LIMIT: "10"
 ```
 
 Example secret values:
@@ -243,172 +331,28 @@ metadata:
 type: Opaque
 stringData:
   pg-connection-string: "postgresql://csearch_nlp_writer:strong-pass@postgres-service.default.svc.cluster.local:5432/csearch"
-  openai-api-key: "replace-me-if-using-openai"
+  openai-api-key: "sk-proj-..."
 ```
-
-If OpenAI remains the embedding provider, change the embedding settings accordingly:
-
-```yaml
-data:
-  EMBEDDING_BACKEND: "openai"
-  EMBEDDING_MODEL: "text-embedding-3-small"
-  EMBEDDING_DIMENSIONS: "1536"
-  EMBEDDING_BASE_URL: ""
-  EMBEDDING_QUERY_PROMPT: ""
-```
-
-## 7. Local Embedding on an RTX 3090
-
-An RTX 3090 is a reasonable target for local `Qwen3-Embedding-8B` inference. For this project, the most practical local options are:
-
-- `Ollama` for the quickest operational path
-- `sentence-transformers` or `vLLM` if you need tighter control over prompts, batching, or output dimensions
-
-Recommended default for a 3090:
-
-- start with `qwen3-embedding:8b-q8_0` in Ollama
-- keep the PostgreSQL column at `vector(4096)` unless storage pressure forces you to shorten vectors later
-- use cosine similarity only
-- embed document chunks without a query prefix
-- embed search queries with a retrieval-oriented prefix
-
-### Option A: Ollama
-
-Install and start Ollama on the GPU host, then pull the model:
-
-```bash
-ollama pull qwen3-embedding:8b-q8_0
-```
-
-Smoke test the local daemon:
-
-```bash
-curl http://localhost:11434/api/embed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-embedding:8b-q8_0",
-    "input": "Clean Water Act section 402 permitting requirements"
-  }'
-```
-
-Batch embedding example in Python:
-
-```python
-import ollama
-
-QUERY_PREFIX = "Represent this query for retrieving relevant legislative passages: "
-
-def embed_documents(texts: list[str]) -> list[list[float]]:
-    response = ollama.embed(
-        model="qwen3-embedding:8b-q8_0",
-        input=texts,
-    )
-    return response["embeddings"]
-
-def embed_queries(texts: list[str]) -> list[list[float]]:
-    response = ollama.embed(
-        model="qwen3-embedding:8b-q8_0",
-        input=[QUERY_PREFIX + text for text in texts],
-    )
-    return response["embeddings"]
-```
-
-Operational notes for Ollama:
-
-- verify the returned vector length once and make the PostgreSQL column match it exactly
-- keep the same model tag for both indexing and query embedding
-- if you later change quantization or dimensions, rebuild the embeddings table rather than mixing vectors
-
-### Option B: Direct Hugging Face Inference
-
-Use this path if you want the official prompt handling and optional dimension shortening in one process.
-
-Install the minimum packages:
-
-```bash
-pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" torch
-```
-
-Example:
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer(
-    "Qwen/Qwen3-Embedding-8B",
-    model_kwargs={"attn_implementation": "flash_attention_2", "device_map": "auto"},
-    tokenizer_kwargs={"padding_side": "left"},
-)
-
-doc_embeddings = model.encode(
-    document_texts,
-    normalize_embeddings=True,
-)
-
-query_embeddings = model.encode(
-    query_texts,
-    prompt_name="query",
-    normalize_embeddings=True,
-)
-```
-
-This path is easier to extend if you later need custom prompt handling, larger batches, or your own vector post-processing before writing into `pgvector`.
-
-### Pipeline Changes Required
-
-To switch the project from hosted OpenAI embeddings to local Qwen3 embeddings:
-
-1. update the schema so `nlp.bill_embeddings.embedding` matches the chosen Qwen3 dimension
-2. replace the embedding client in both ingest and query paths with one local backend
-3. apply the same query prefix strategy every time a search query is embedded
-4. re-embed the full corpus once, then rebuild the ANN index
-5. keep the reranker and answer-generation path independent from the embedding provider
 
 ## 8. Kubernetes Footprint
 
-With `pgvector`, the deployment is smaller than the old Qdrant plan.
+Required:
 
-You still need:
-
-- namespace
+- namespace (`csearch-nlp`)
 - API deployment
-- Redis connectivity
 - secrets/configmaps
-- optional PVC for cached raw full text
-- optional CronJob for nightly sync
+- PVC for working data (tarp-data-pvc, congress-data-pvc)
+- CronJob for nightly sync (`tarp-nightly-updater`)
 
-You do not need:
+## 10. Nightly Sync
 
-- Qdrant StatefulSet
-- Qdrant service
-- Qdrant PV/PVC
-- Qdrant collection bootstrap step
+The nightly updater is deployed as a Kubernetes CronJob (`tarp-nightly-updater`) and orchestrated by `project-tarp/nightly_update.sh`. Each step is idempotent — re-running converges cleanly without manual cleanup.
 
-That simplification is the main operational win of the migration.
+Pipeline order: `fetcher.py` → `content_hasher.py` → `chunker.py` → `embedder.py` → `upserter.py`
 
-## 9. Nightly Sync
+See `UPDATE.md` for full operational details.
 
-The sync job should:
-
-1. query for new or updated bills
-2. fetch current source text
-3. re-chunk changed bills
-4. embed changed chunks
-5. replace rows in PostgreSQL
-6. update sync state
-
-Example CronJob command:
-
-```yaml
-args:
-  - python
-  - -m
-  - csearch_nlp.pipeline.sync
-```
-
-Keep the job idempotent. If it fails halfway through, re-running it should converge cleanly without manual cleanup.
-
-## 10. Operational Notes
+## 11. Operational Notes
 
 ### PostgreSQL Tuning
 
@@ -435,20 +379,15 @@ Do not overwrite the only embeddings copy during a model migration.
 
 Backups now come from PostgreSQL backups rather than a separate Qdrant snapshot flow. That is operationally simpler, but it also means the database backup policy now covers both transactional and vector data.
 
-## 11. Rollout Sequence
+## 12. Rollout Sequence
 
-Recommended rollout order:
+Steps 1–4 are complete. Remaining:
 
-1. enable `pgvector` in a development database
-2. create `nlp` schema and tables
-3. load a small sample corpus from `project-tarp/`
-4. benchmark vector search latency and recall
-5. wire up hybrid retrieval in the API
-6. add reranking and answer generation
-7. add scheduled incremental sync
-8. only then scale corpus size
+5. wire up semantic search API route (section 3)
+6. wire up hybrid retrieval (section 4)
+7. add reranking and answer generation
 
-## 12. Files and Modules
+## 13. Files and Modules
 
 Suggested project layout after the migration:
 
@@ -483,15 +422,3 @@ csearch_nlp/
 
 The key difference from the older design is `loader.py` and SQL migrations replace the Qdrant upsert layer.
 
-## 13. Current Implication for Existing POC Code
-
-`project-tarp/` still contains Qdrant-oriented proof-of-concept tooling. That is acceptable as historical prototype code, but it should not be treated as the storage design for the main system anymore.
-
-When promoting code from the prototype:
-
-- keep fetch logic
-- keep chunking logic
-- keep embedding logic
-- replace Qdrant-specific load and query layers with PostgreSQL implementations
-
-That boundary should stay explicit so the repository does not drift into supporting two vector stores by accident.
