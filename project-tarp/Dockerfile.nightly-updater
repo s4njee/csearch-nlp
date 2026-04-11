@@ -23,6 +23,7 @@ COPY fetcher.py \
      nightly_update.sh \
      ./
 
-RUN chmod +x nightly_update.sh
+RUN chmod a+r fetcher.py chunker.py embedder.py upserter.py content_hasher.py nightly_update.sh \
+    && chmod a+rx nightly_update.sh
 
 ENTRYPOINT ["bash", "nightly_update.sh"]
