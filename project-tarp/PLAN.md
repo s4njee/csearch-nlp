@@ -1,7 +1,7 @@
 # Project TARP — 2008 Bill Embeddings Proof of Concept
 
 ## Objective
-Build a minimal, end-to-end pipeline to download all U.S. Congressional bills from the 110th Congress (2007–2008), clean and chunk their text, generate vector embeddings using OpenAI (`text-embedding-3-small`), store them in a local Qdrant instance, and run semantic search queries with LLM-generated answers.
+Build a minimal, end-to-end pipeline to download all U.S. Congressional bills from the 110th Congress (2007–2008), clean and chunk their text, generate vector embeddings using OpenAI (`text-embedding-3-small`), store them in PostgreSQL with `pgvector`, and run semantic search queries with LLM-generated answers.
 
 This is a proof-of-concept (POC) to validate the chunking strategy and OpenAI embedding costs before scaling to the full 50-year dataset in the main `csearch-nlp` repository.
 
@@ -13,7 +13,7 @@ The Project TARP pipeline now runs end to end for the 110th Congress:
 - raw bill text fetched from GovInfo
 - bill text parsed and chunked with exact section-level dedup
 - full corpus embedded with OpenAI `text-embedding-3-small`
-- vectors loaded into Qdrant on the `mars` Kubernetes cluster
+- vectors loaded into PostgreSQL `pgvector` tables on the `mars` Kubernetes cluster
 - semantic search and grounded answer generation working through `query.py`
 
 Representative observed outputs:
@@ -22,7 +22,7 @@ Representative observed outputs:
 - dedup: `11,571` duplicate sections removed
 - embedding tokens: `55,260,842`
 - full-corpus embedding cost: about `$1.11`
-- Qdrant endpoint: `http://192.168.1.156:6333`
+- PostgreSQL DSN: `PG_CONNECTION_STRING`
 
 ## Tech Stack
 - **Language**: Python 3.10+
@@ -31,7 +31,7 @@ Representative observed outputs:
 - **Token Counting**: `tiktoken` (`cl100k_base` encoding, used by `text-embedding-3-small`)
 - **Embeddings API**: `openai` (`text-embedding-3-small`, 1536 dims, $0.02/1M tokens)
 - **Generative API**: `openai` (`gpt-5.4-nano`, $0.20/1M input tokens)
-- **Vector DB**: `qdrant-client` (running Qdrant via local Docker container)
+- **Vector DB**: PostgreSQL + `pgvector` (`psycopg2-binary`)
 
 ## Data Source
 Bill metadata comes from the `@unitedstates/congress` scraper, which populates a local `110/bills/{type}/{type}{number}/data.json` directory tree at the project root. The fetcher reads this metadata (bill status, title, etc.) to determine which GovInfo version to download (enrolled > engrossed > reported > introduced), then saves the full text to `project-tarp/data/bills_110/{type}/`.
@@ -130,19 +130,18 @@ Bill metadata comes from the `@unitedstates/congress` scraper, which populates a
 - Output format: one embedded chunk per JSONL line, with the original chunk metadata plus an `"embedding"` field containing the 1536-float vector. The embedded shard directory also gets a lightweight `manifest.json`.
 - Supports `--model` and `--dimensions` flags for experimenting with `text-embedding-3-large`.
 
-### Step 4: Storage Setup (Qdrant Upsert) ✅ COMPLETE
-**Goal:** Load the vectors and metadata into a local Qdrant instance.
+### Step 4: Storage Setup (PostgreSQL pgvector Upsert) ✅ COMPLETE
+**Goal:** Load the vectors and metadata into PostgreSQL tables backed by `pgvector`.
 - `upserter.py` is implemented and reads embedded shard files from `./data/embedded_chunks/`.
-- Qdrant is deployed on the `mars` Kubernetes context in namespace `csearch-nlp` with a `LoadBalancer` service.
-- Current external endpoint: REST `http://192.168.1.156:6333`, gRPC `192.168.1.156:6334`.
-- The service is healthy (`/readyz` returns `all shards are ready`) and the `bill_chunks` collection has been populated from the embedded shard output.
-- Upserts use deterministic UUID point IDs derived from canonical chunk identity so reruns are stable.
+- The loader targets `nlp.bill_chunks` and `nlp.bill_embeddings` via `PG_CONNECTION_STRING`.
+- The database has the `vector` extension enabled and uses `vector(1536)` columns plus an HNSW index for similarity search.
+- Upserts use deterministic chunk source hashes so reruns remain idempotent.
 - Payloads are intentionally lean by default; large alias arrays are omitted unless explicitly requested.
 
 ### Step 5: The Query Engine & Answer Generation ✅ COMPLETE
 **Goal:** Run semantic searches and generate readable answers using OpenAI's latest models.
-- `query.py` is implemented as an interactive CLI over the `bill_chunks` Qdrant collection.
-- The query path embeds the user query with `text-embedding-3-small`, searches Qdrant, prints the top semantic matches, and optionally asks `gpt-5.4-nano` for a grounded answer.
+- `query.py` is implemented as an interactive CLI over PostgreSQL `pgvector`.
+- The query path embeds the user query with `text-embedding-3-small`, searches `nlp.bill_embeddings` joined to `nlp.bill_chunks`, prints the top semantic matches, and optionally asks `gpt-5.4-nano` for a grounded answer.
 - The first end-to-end test query was successful:
   - Query: `"What did Congress do about the financial crisis in 2008?"`
   - Top hits included `hr7275-110`, `hr7104-110`, and `hr3666-110`
