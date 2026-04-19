@@ -171,6 +171,9 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 def chunk_identity(chunk: dict) -> tuple[str, str, int]:
     """Stable identity for incremental embedding after dedup."""
+    source_hash = chunk.get("source_hash")
+    if source_hash:
+        return (str(source_hash), "", 0)
     document_hash = chunk.get("document_text_hash")
     section_hash = chunk.get("section_text_hash")
     if document_hash or section_hash:
@@ -189,7 +192,11 @@ def chunk_identity(chunk: dict) -> tuple[str, str, int]:
 def chunk_token_count(chunk: dict) -> int:
     """Return the token count recorded for a chunk, or 0 if unavailable."""
     try:
-        return int(chunk.get("tokens", 0) or 0)
+        for key in ("token_count", "tokens"):
+            value = chunk.get(key)
+            if value not in (None, ""):
+                return int(value)
+        return 0
     except (TypeError, ValueError):
         return 0
 
@@ -801,9 +808,9 @@ def run_openai_batch_backend(client: OpenAI, args, input_path: Path, output_path
 
 def main():
     parser = argparse.ArgumentParser(description="Embed text chunks via OpenAI or Ollama")
-    parser.add_argument("--input", type=str, default=str(INPUT_FILE),
+    parser.add_argument("--input", "--input-dir", dest="input", type=str, default=str(INPUT_FILE),
                         help=f"Input chunk shard directory (default: {INPUT_FILE})")
-    parser.add_argument("--output", type=str, default=str(OUTPUT_FILE),
+    parser.add_argument("--output", "--output-dir", dest="output", type=str, default=str(OUTPUT_FILE),
                         help=f"Output embedded shard directory (default: {OUTPUT_FILE})")
     parser.add_argument("--backend", choices=["openai", "openai-batch", "ollama"], default=os.environ.get("EMBEDDING_BACKEND", DEFAULT_BACKEND),
                         help=f"Embedding backend (default: {os.environ.get('EMBEDDING_BACKEND', DEFAULT_BACKEND)})")

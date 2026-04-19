@@ -7,10 +7,10 @@
 # ]
 # ///
 """
-query.py — Run semantic search against embedded bill chunks in PostgreSQL pgvector.
+query.py — Run semantic search against embedded bill and vote chunks in PostgreSQL pgvector.
 
 Embeds a natural-language query with OpenAI or Ollama, searches
-`nlp.bill_embeddings` joined to `nlp.bill_chunks`, prints the top matches, and
+`nlp.bill_embeddings` / `nlp.vote_embeddings`, prints the top matches, and
 can optionally ask an OpenAI LLM to synthesize an answer grounded in the
 retrieved chunks.
 
@@ -44,8 +44,10 @@ except ImportError:
 
 DEFAULT_DSN = os.environ.get("PG_CONNECTION_STRING", "")
 DEFAULT_SCHEMA = "nlp"
-DEFAULT_CHUNK_TABLE = "bill_chunks"
-DEFAULT_EMBEDDING_TABLE = "bill_embeddings"
+DEFAULT_BILL_CHUNK_TABLE = "bill_chunks"
+DEFAULT_BILL_EMBEDDING_TABLE = "bill_embeddings"
+DEFAULT_VOTE_CHUNK_TABLE = "vote_chunks"
+DEFAULT_VOTE_EMBEDDING_TABLE = "vote_embeddings"
 DEFAULT_BACKEND = "openai"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_OLLAMA_EMBED_MODEL = "qwen3-embedding:8b-q8_0"
@@ -57,6 +59,7 @@ DEFAULT_TOP_K = 5
 DEFAULT_SNIPPET_LEN = 400
 DEFAULT_CONGRESS_MIN = 0
 DEFAULT_CONGRESS_MAX = 999
+DEFAULT_INDEX = "bills"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,15 +71,26 @@ log = logging.getLogger("query")
 
 @dataclass
 class SearchHit:
-    bill_id: str
-    section_enum: str
-    section_header: str
-    title: str
-    status: str
-    body: str
+    source_kind: str
+    source_id: str
     similarity: float
     congress: int
-    chunk_type: str
+    body: str
+    category: str = ""
+    title: str = ""
+    section_enum: str = ""
+    section_header: str = ""
+    status: str = ""
+    chunk_type: str = ""
+    bill_id: str = ""
+    vote_id: str = ""
+    session: str = ""
+    chamber: str = ""
+    vote_date: str = ""
+    result: str = ""
+    vote_type: str = ""
+    question: str = ""
+    subject: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +150,17 @@ def vector_literal(values: list[float]) -> str:
     return "[" + ",".join(f"{float(v):.17g}" for v in values) + "]"
 
 
+def relation_exists(dsn: str, schema: str, table: str) -> bool:
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+            row = cur.fetchone()
+            return bool(row and row[0])
+    finally:
+        conn.close()
+
+
 def snippet(text: str, max_len: int) -> str:
     clean = " ".join((text or "").split())
     if len(clean) <= max_len:
@@ -144,6 +169,20 @@ def snippet(text: str, max_len: int) -> str:
 
 
 def format_hit(hit: SearchHit, max_len: int) -> str:
+    if hit.source_kind == "vote":
+        bill_line = f" | bill {hit.bill_id}" if hit.bill_id else ""
+        chamber_label = "House" if hit.chamber.lower() == "h" else "Senate" if hit.chamber.lower() == "s" else hit.chamber
+        meta = " · ".join(part for part in [
+            f"vote {hit.vote_id}",
+            chamber_label,
+            f"Congress {hit.congress}" if hit.congress else "",
+            hit.result or "",
+        ] if part)
+        return (
+            f"[{hit.similarity:.4f}] {meta}{bill_line}\n"
+            f"{snippet(hit.body, max_len)}"
+        )
+
     header = hit.section_header or "(no header)"
     section_enum = hit.section_enum or "?"
     title_line = f" | {hit.title}" if hit.title else ""
@@ -156,6 +195,26 @@ def format_hit(hit: SearchHit, max_len: int) -> str:
 def build_answer_context(hits: list[SearchHit], max_len: int) -> str:
     parts = []
     for idx, hit in enumerate(hits, 1):
+        if hit.source_kind == "vote":
+            parts.append(
+                "\n".join([
+                    f"Result {idx}",
+                    f"Vote ID: {hit.vote_id}",
+                    f"Bill ID: {hit.bill_id or '—'}",
+                    f"Session: {hit.session or '—'}",
+                    f"Chamber: {hit.chamber or '—'}",
+                    f"Congress: {hit.congress}",
+                    f"Date: {hit.vote_date or '—'}",
+                    f"Type: {hit.vote_type or '—'}",
+                    f"Category: {hit.category or '—'}",
+                    f"Question: {hit.question or '—'}",
+                    f"Subject: {hit.subject or '—'}",
+                    f"Result: {hit.result or '—'}",
+                    f"Text: {snippet(hit.body, max_len)}",
+                ])
+            )
+            continue
+
         parts.append(
             "\n".join([
                 f"Result {idx}",
@@ -178,8 +237,8 @@ def generate_answer(client: OpenAI, model: str, query: str, hits: list[SearchHit
             {
                 "role": "system",
                 "content": (
-                    "Answer the user's question using only the provided congressional bill excerpts. "
-                    "Cite specific bill numbers when possible, mention uncertainty when the excerpts are insufficient, "
+                    "Answer the user's question using only the provided congressional bill and vote excerpts. "
+                    "Cite specific bill numbers and vote IDs when possible, mention uncertainty when the excerpts are insufficient, "
                     "and do not fabricate facts."
                 ),
             },
@@ -192,7 +251,7 @@ def generate_answer(client: OpenAI, model: str, query: str, hits: list[SearchHit
     return response.output_text.strip()
 
 
-def pgvector_search(
+def pgvector_search_bill(
     dsn: str,
     schema: str,
     chunk_table: str,
@@ -231,7 +290,9 @@ def pgvector_search(
 
     return [
         SearchHit(
-            bill_id=row[0] or "?",
+            source_kind="bill",
+            source_id=row[0] or "?",
+            bill_id=row[0] or "",
             section_enum=row[1] or "",
             section_header=row[2] or "",
             title=row[3] or "",
@@ -245,21 +306,92 @@ def pgvector_search(
     ]
 
 
+def pgvector_search_vote(
+    dsn: str,
+    schema: str,
+    chunk_table: str,
+    embedding_table: str,
+    vector: list[float],
+    limit: int,
+    congress_min: int,
+    congress_max: int,
+) -> list[SearchHit]:
+    vector_sql = vector_literal(vector)
+    sql = f"""
+        SELECT
+          v.vote_id,
+          v.congress::text AS congress,
+          v.chamber,
+          v.session,
+          v.number::text AS number,
+          v.vote_date,
+          v.category,
+          v.vote_type,
+          v.question,
+          v.subject,
+          v.result,
+          v.bill_id,
+          v.body,
+          1 - (e.embedding <=> %s::vector) AS similarity,
+          v.chunk_index
+        FROM {schema}.{embedding_table} e
+        JOIN {schema}.{chunk_table} v ON v.id = e.chunk_id
+        WHERE v.congress BETWEEN %s AND %s
+        ORDER BY e.embedding <=> %s::vector
+        LIMIT %s
+    """
+
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (vector_sql, congress_min, congress_max, vector_sql, limit))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        SearchHit(
+            source_kind="vote",
+            source_id=row[0] or "?",
+            vote_id=row[0] or "",
+            congress=int(row[1] or 0),
+            session=row[3] or "",
+            chamber=row[2] or "",
+            vote_date=row[5].isoformat() if row[5] else "",
+            body=row[12] or "",
+            similarity=float(row[13] or 0.0),
+            bill_id=row[11] or "",
+            category=row[6] or "",
+            vote_type=row[7] or "",
+            question=row[8] or "",
+            subject=row[9] or "",
+            result=row[10] or "",
+        )
+        for row in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Semantic search over Project TARP bill chunks in pgvector")
+    parser = argparse.ArgumentParser(description="Semantic search over Project TARP bill and vote chunks in pgvector")
     parser.add_argument("query", nargs="*", help="Natural-language query text")
     parser.add_argument("--dsn", type=str, default=DEFAULT_DSN,
                         help="PostgreSQL connection string (default: PG_CONNECTION_STRING env var)")
     parser.add_argument("--schema", type=str, default=DEFAULT_SCHEMA,
                         help=f"Target schema (default: {DEFAULT_SCHEMA})")
-    parser.add_argument("--chunk-table", type=str, default=DEFAULT_CHUNK_TABLE,
-                        help=f"Chunk table name (default: {DEFAULT_CHUNK_TABLE})")
-    parser.add_argument("--embedding-table", type=str, default=DEFAULT_EMBEDDING_TABLE,
-                        help=f"Embedding table name (default: {DEFAULT_EMBEDDING_TABLE})")
+    parser.add_argument("--index", choices=["bills", "votes", "both"], default=DEFAULT_INDEX,
+                        help=f"Search index to query (default: {DEFAULT_INDEX})")
+    parser.add_argument("--chunk-table", type=str, default=DEFAULT_BILL_CHUNK_TABLE,
+                        help=f"Bill chunk table name (default: {DEFAULT_BILL_CHUNK_TABLE})")
+    parser.add_argument("--embedding-table", type=str, default=DEFAULT_BILL_EMBEDDING_TABLE,
+                        help=f"Bill embedding table name (default: {DEFAULT_BILL_EMBEDDING_TABLE})")
+    parser.add_argument("--vote-chunk-table", type=str, default=DEFAULT_VOTE_CHUNK_TABLE,
+                        help=f"Vote chunk table name (default: {DEFAULT_VOTE_CHUNK_TABLE})")
+    parser.add_argument("--vote-embedding-table", type=str, default=DEFAULT_VOTE_EMBEDDING_TABLE,
+                        help=f"Vote embedding table name (default: {DEFAULT_VOTE_EMBEDDING_TABLE})")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
                         help=f"Number of search hits to return (default: {DEFAULT_TOP_K})")
     parser.add_argument("--congress-min", type=int, default=DEFAULT_CONGRESS_MIN,
@@ -338,19 +470,47 @@ def main():
     )
 
     log.info(
-        f"Searching {args.schema}.{args.embedding_table} via PostgreSQL "
+        f"Searching {args.index} embeddings via PostgreSQL "
         f"(top_k={args.top_k}, congress={args.congress_min}-{args.congress_max})"
     )
-    hits = pgvector_search(
-        dsn=args.dsn,
-        schema=args.schema,
-        chunk_table=args.chunk_table,
-        embedding_table=args.embedding_table,
-        vector=vector,
-        limit=args.top_k,
-        congress_min=args.congress_min,
-        congress_max=args.congress_max,
-    )
+    hits: list[SearchHit] = []
+    if args.index in {"bills", "both"}:
+        bill_tables_exist = relation_exists(args.dsn, args.schema, args.chunk_table) and relation_exists(args.dsn, args.schema, args.embedding_table)
+        if bill_tables_exist:
+            hits.extend(
+                pgvector_search_bill(
+                    dsn=args.dsn,
+                    schema=args.schema,
+                    chunk_table=args.chunk_table,
+                    embedding_table=args.embedding_table,
+                    vector=vector,
+                    limit=args.top_k,
+                    congress_min=args.congress_min,
+                    congress_max=args.congress_max,
+                )
+            )
+        else:
+            log.warning("Bill embedding tables not found; skipping bill search")
+    if args.index in {"votes", "both"}:
+        vote_tables_exist = relation_exists(args.dsn, args.schema, args.vote_chunk_table) and relation_exists(args.dsn, args.schema, args.vote_embedding_table)
+        if vote_tables_exist:
+            hits.extend(
+                pgvector_search_vote(
+                    dsn=args.dsn,
+                    schema=args.schema,
+                    chunk_table=args.vote_chunk_table,
+                    embedding_table=args.vote_embedding_table,
+                    vector=vector,
+                    limit=args.top_k,
+                    congress_min=args.congress_min,
+                    congress_max=args.congress_max,
+                )
+            )
+        else:
+            log.warning("Vote embedding tables not found; skipping vote search")
+
+    hits.sort(key=lambda hit: hit.similarity, reverse=True)
+    hits = hits[:args.top_k]
 
     if not hits:
         print("No results.")

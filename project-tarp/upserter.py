@@ -54,6 +54,8 @@ DEFAULT_DSN = os.environ.get("PG_CONNECTION_STRING", "")
 DEFAULT_SCHEMA = "nlp"
 DEFAULT_CHUNK_TABLE = "bill_chunks"
 DEFAULT_EMBEDDING_TABLE = "bill_embeddings"
+DEFAULT_VOTE_CHUNK_TABLE = "vote_chunks"
+DEFAULT_VOTE_EMBEDDING_TABLE = "vote_embeddings"
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_VECTOR_SIZE = 1536
 DEFAULT_MODEL = "text-embedding-3-small"
@@ -109,12 +111,35 @@ def text_value(value) -> str:
     return "" if value is None else str(value)
 
 
+def parse_timestamptz(value):
+    if value in (None, ""):
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
 def chunk_source_hash(chunk: dict) -> str:
     raw = "|".join([
         str(chunk.get("bill_id", "")),
         str(chunk.get("document_text_hash", "")),
         str(chunk.get("section_text_hash", "")),
         str(chunk.get("chunk_index", 0)),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def vote_source_hash(chunk: dict) -> str:
+    source_hash = text_value(chunk.get("source_hash")).strip()
+    if source_hash:
+        return source_hash
+    raw = "|".join([
+        text_value(chunk.get("vote_id")),
+        text_value(chunk.get("chunk_index", 0)),
+        text_value(chunk.get("content_hash")),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -155,6 +180,32 @@ def build_chunk_row(chunk: dict, model: str, include_aliases: bool) -> tuple:
         Json(chunk.get("document_text_hashes", [])),
         Json(chunk.get("document_aliases", [])) if include_aliases else None,
         Json(chunk.get("section_aliases", [])) if include_aliases else None,
+        vector_literal(chunk["embedding"]),
+        model,
+    )
+
+
+def build_vote_row(chunk: dict, model: str) -> tuple:
+    source_hash = vote_source_hash(chunk)
+    body = text_value(chunk.get("text", chunk.get("body", "")))
+    return (
+        source_hash,
+        text_value(chunk.get("vote_id")),
+        safe_int(chunk.get("congress")),
+        text_value(chunk.get("chamber")),
+        text_value(chunk.get("session")),
+        safe_int(chunk.get("number")),
+        parse_timestamptz(chunk.get("date")),
+        text_value(chunk.get("category")),
+        text_value(chunk.get("type")),
+        text_value(chunk.get("question")),
+        text_value(chunk.get("subject")),
+        text_value(chunk.get("result")),
+        text_value(chunk.get("bill_id")) or None,
+        body,
+        safe_int(chunk.get("token_count", chunk.get("tokens"))),
+        safe_int(chunk.get("chunk_index")),
+        text_value(chunk.get("content_hash")),
         vector_literal(chunk["embedding"]),
         model,
     )
@@ -265,6 +316,64 @@ def ensure_schema(conn, schema: str, chunk_table: str, embedding_table: str, vec
             cur.execute(sql)
 
 
+def ensure_vote_schema(conn, schema: str, chunk_table: str, embedding_table: str, vector_size: int, recreate: bool) -> None:
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+
+        if recreate:
+            log.info("Dropping existing vote tables before recreate")
+            cur.execute(f"DROP TABLE IF EXISTS {schema}.{embedding_table} CASCADE")
+            cur.execute(f"DROP TABLE IF EXISTS {schema}.{chunk_table} CASCADE")
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.{chunk_table} (
+              id BIGSERIAL PRIMARY KEY,
+              source_hash TEXT NOT NULL UNIQUE,
+              vote_id TEXT NOT NULL,
+              congress INTEGER NOT NULL,
+              chamber TEXT NOT NULL,
+              session TEXT NOT NULL,
+              number INTEGER NOT NULL,
+              vote_date TIMESTAMPTZ,
+              category TEXT,
+              vote_type TEXT,
+              question TEXT,
+              subject TEXT,
+              result TEXT,
+              bill_id TEXT,
+              body TEXT NOT NULL,
+              token_count INTEGER NOT NULL,
+              chunk_index INTEGER NOT NULL DEFAULT 0,
+              content_hash TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.{embedding_table} (
+              chunk_id BIGINT PRIMARY KEY REFERENCES {schema}.{chunk_table}(id) ON DELETE CASCADE,
+              embedding vector({vector_size}) NOT NULL,
+              model TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+
+        for sql in [
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_vote_id_idx ON {schema}.{chunk_table} (vote_id)",
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_bill_id_idx ON {schema}.{chunk_table} (bill_id)",
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_congress_idx ON {schema}.{chunk_table} (congress)",
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_chamber_idx ON {schema}.{chunk_table} (chamber)",
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_date_idx ON {schema}.{chunk_table} (vote_date)",
+            f"CREATE INDEX IF NOT EXISTS {chunk_table}_source_hash_idx ON {schema}.{chunk_table} (source_hash)",
+        ]:
+            cur.execute(sql)
+
+
 def ensure_embedding_dimensions(conn, schema: str, embedding_table: str, vector_size: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -344,6 +453,46 @@ def stage_shard(cur, rows: list[tuple], batch_size: int) -> None:
     )
 
 
+def stage_vote_shard(cur, rows: list[tuple], batch_size: int) -> None:
+    cur.execute(
+        """
+        CREATE TEMP TABLE staging_vote_chunks (
+          source_hash TEXT,
+          vote_id TEXT,
+          congress INTEGER,
+          chamber TEXT,
+          session TEXT,
+          number INTEGER,
+          vote_date TIMESTAMPTZ,
+          category TEXT,
+          vote_type TEXT,
+          question TEXT,
+          subject TEXT,
+          result TEXT,
+          bill_id TEXT,
+          body TEXT,
+          token_count INTEGER,
+          chunk_index INTEGER,
+          content_hash TEXT,
+          embedding_text TEXT,
+          model TEXT
+        ) ON COMMIT DROP
+        """
+    )
+    execute_values(
+        cur,
+        """
+        INSERT INTO staging_vote_chunks (
+          source_hash, vote_id, congress, chamber, session, number, vote_date,
+          category, vote_type, question, subject, result, bill_id, body,
+          token_count, chunk_index, content_hash, embedding_text, model
+        ) VALUES %s
+        """,
+        rows,
+        page_size=batch_size,
+    )
+
+
 def replace_shard(conn, schema: str, chunk_table: str, embedding_table: str, shard_rows: list[tuple], batch_size: int) -> None:
     if not shard_rows:
         return
@@ -389,6 +538,47 @@ def replace_shard(conn, schema: str, chunk_table: str, embedding_table: str, sha
             )
 
 
+def replace_vote_shard(conn, schema: str, chunk_table: str, embedding_table: str, shard_rows: list[tuple], batch_size: int) -> None:
+    if not shard_rows:
+        return
+
+    source_hashes = sorted({row[0] for row in shard_rows if row[0]})
+    with conn:
+        with conn.cursor() as cur:
+            stage_vote_shard(cur, shard_rows, batch_size=batch_size)
+            cur.execute(
+                f"DELETE FROM {schema}.{chunk_table} WHERE source_hash = ANY(%s)",
+                (source_hashes,),
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.{chunk_table} (
+                  source_hash, vote_id, congress, chamber, session, number, vote_date,
+                  category, vote_type, question, subject, result, bill_id, body,
+                  token_count, chunk_index, content_hash
+                )
+                SELECT
+                  source_hash, vote_id, congress, chamber, session, number, vote_date,
+                  category, vote_type, question, subject, result, bill_id, body,
+                  token_count, chunk_index, content_hash
+                FROM staging_vote_chunks
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.{embedding_table} (chunk_id, embedding, model)
+                SELECT c.id, s.embedding_text::vector, s.model
+                FROM {schema}.{chunk_table} c
+                JOIN staging_vote_chunks s ON s.source_hash = c.source_hash
+                WHERE c.source_hash = ANY(%s)
+                ON CONFLICT (chunk_id) DO UPDATE
+                  SET embedding = EXCLUDED.embedding,
+                      model = EXCLUDED.model
+                """,
+                (source_hashes,),
+            )
+
+
 def verify_shard_rows(shard_path: Path, chunks: list[dict]) -> tuple[list[dict], int]:
     rows = []
     tokens = 0
@@ -397,6 +587,19 @@ def verify_shard_rows(shard_path: Path, chunks: list[dict]) -> tuple[list[dict],
             raise RuntimeError(f"Missing embedding in shard {shard_path}")
         rows.append(chunk)
         tokens += safe_int(chunk.get("tokens"))
+    return rows, tokens
+
+
+def verify_vote_shard_rows(shard_path: Path, chunks: list[dict]) -> tuple[list[dict], int]:
+    rows = []
+    tokens = 0
+    for chunk in chunks:
+        if "embedding" not in chunk:
+            raise RuntimeError(f"Missing embedding in shard {shard_path}")
+        if "source_hash" not in chunk:
+            raise RuntimeError(f"Missing source_hash in shard {shard_path}")
+        rows.append(chunk)
+        tokens += safe_int(chunk.get("token_count", chunk.get("tokens")), 0)
     return rows, tokens
 
 
@@ -465,18 +668,20 @@ def verify_counts(conn, schema: str, chunk_table: str, embedding_table: str) -> 
 
 def main():
     parser = argparse.ArgumentParser(description="Load embedded chunk shards into PostgreSQL pgvector tables")
-    parser.add_argument("--input", type=str, default=str(INPUT_DIR),
-                        help=f"Input embedded shard directory (default: {INPUT_DIR})")
+    parser.add_argument("--mode", choices=["bills", "votes"], default="bills",
+                        help="Load bill or vote embedding tables (default: bills)")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Input embedded shard directory (default depends on --mode)")
     parser.add_argument("--dsn", type=str, default=DEFAULT_DSN,
                         help="PostgreSQL connection string (default: PG_CONNECTION_STRING env var)")
     parser.add_argument("--create-db", action="store_true",
                         help="Create the target database and enable pgvector if they don't exist")
     parser.add_argument("--schema", type=str, default=DEFAULT_SCHEMA,
                         help=f"Target schema (default: {DEFAULT_SCHEMA})")
-    parser.add_argument("--chunk-table", type=str, default=DEFAULT_CHUNK_TABLE,
-                        help=f"Chunk table name (default: {DEFAULT_CHUNK_TABLE})")
-    parser.add_argument("--embedding-table", type=str, default=DEFAULT_EMBEDDING_TABLE,
-                        help=f"Embedding table name (default: {DEFAULT_EMBEDDING_TABLE})")
+    parser.add_argument("--chunk-table", type=str, default=None,
+                        help="Chunk table name (default depends on --mode)")
+    parser.add_argument("--embedding-table", type=str, default=None,
+                        help="Embedding table name (default depends on --mode)")
     parser.add_argument("--vector-size", type=int, default=DEFAULT_VECTOR_SIZE,
                         help=f"Vector size (default: {DEFAULT_VECTOR_SIZE})")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
@@ -507,6 +712,13 @@ def main():
         log.error("PostgreSQL DSN not provided. Set PG_CONNECTION_STRING or pass --dsn.")
         return
 
+    if args.input is None:
+        args.input = str(INPUT_DIR if args.mode == "bills" else DATA_DIR / "embedded_vote_chunks")
+    if args.chunk_table is None:
+        args.chunk_table = DEFAULT_CHUNK_TABLE if args.mode == "bills" else DEFAULT_VOTE_CHUNK_TABLE
+    if args.embedding_table is None:
+        args.embedding_table = DEFAULT_EMBEDDING_TABLE if args.mode == "bills" else DEFAULT_VOTE_EMBEDDING_TABLE
+
     input_path = Path(args.input)
     shard_paths: list[Path] = []
     if not args.index_only:
@@ -526,7 +738,7 @@ def main():
 
     mode = "index-only" if args.index_only else "full-load"
     log.info(
-        f"Starting pgvector upserter | mode={mode} | input={input_path} | schema={args.schema} | "
+        f"Starting pgvector upserter | mode={mode} | load={args.mode} | input={input_path} | schema={args.schema} | "
         f"tables={args.schema}.{args.chunk_table},{args.schema}.{args.embedding_table}"
     )
 
@@ -543,7 +755,10 @@ def main():
     conn = psycopg2.connect(args.dsn)
     try:
         # Schema setup
-        ensure_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
+        if args.mode == "votes":
+            ensure_vote_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
+        else:
+            ensure_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
         ensure_embedding_dimensions(conn, args.schema, args.embedding_table, args.vector_size)
         conn.commit()
 
@@ -568,11 +783,18 @@ def main():
         for shard_index, shard_path in enumerate(shard_paths, 1):
             log.info(f"Scanning shard {shard_index}/{len(shard_paths)}: {shard_path.name}")
             chunk_dicts = read_jsonl(shard_path)
-            rows, shard_tokens = verify_shard_rows(shard_path, chunk_dicts)
-            shard_rows = [
-                build_chunk_row(chunk=chunk, model=args.model, include_aliases=args.include_aliases)
-                for chunk in rows
-            ]
+            if args.mode == "votes":
+                rows, shard_tokens = verify_vote_shard_rows(shard_path, chunk_dicts)
+                shard_rows = [
+                    build_vote_row(chunk=chunk, model=args.model)
+                    for chunk in rows
+                ]
+            else:
+                rows, shard_tokens = verify_shard_rows(shard_path, chunk_dicts)
+                shard_rows = [
+                    build_chunk_row(chunk=chunk, model=args.model, include_aliases=args.include_aliases)
+                    for chunk in rows
+                ]
             total_chunks += len(shard_rows)
             total_tokens += shard_tokens
             log.info(f"  {len(shard_rows)} rows, {shard_tokens:,} tokens")
@@ -581,14 +803,24 @@ def main():
                 continue
 
             log.info(f"Loading shard {shard_index}/{len(shard_paths)}: {shard_path.name} ({len(shard_rows)} rows)")
-            replace_shard(
-                conn=conn,
-                schema=args.schema,
-                chunk_table=args.chunk_table,
-                embedding_table=args.embedding_table,
-                shard_rows=shard_rows,
-                batch_size=args.batch_size,
-            )
+            if args.mode == "votes":
+                replace_vote_shard(
+                    conn=conn,
+                    schema=args.schema,
+                    chunk_table=args.chunk_table,
+                    embedding_table=args.embedding_table,
+                    shard_rows=shard_rows,
+                    batch_size=args.batch_size,
+                )
+            else:
+                replace_shard(
+                    conn=conn,
+                    schema=args.schema,
+                    chunk_table=args.chunk_table,
+                    embedding_table=args.embedding_table,
+                    shard_rows=shard_rows,
+                    batch_size=args.batch_size,
+                )
             upserted += len(shard_rows)
             log.info(f"  Shard {shard_index}/{len(shard_paths)} done: {upserted:,} total rows loaded")
 

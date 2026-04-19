@@ -134,7 +134,7 @@ def main() -> int:
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    bills_dir = data_dir / "bills" / str(args.congress)
+    bills_dir = data_dir / f"bills_{args.congress}"
     manifest_path = data_dir / "hash_manifests" / f"{args.congress}.json"
 
     if not bills_dir.exists():

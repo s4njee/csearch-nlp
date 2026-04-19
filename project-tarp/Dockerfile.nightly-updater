@@ -1,6 +1,4 @@
-# Use the existing amd64 upserter image as a local base so this can be built
-# even when Docker Hub metadata resolution is unavailable on the builder host.
-FROM csearch-upserter:latest
+FROM registry.s8njee.com/csearch-upserter:latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
