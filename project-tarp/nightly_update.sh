@@ -70,7 +70,9 @@ python chunker.py --congresses "$CONGRESS"
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- [4/4] Embedding new chunks ---"
-python embedder.py --congresses "$CONGRESS"
+python embedder.py \
+  --input "$DATA_DIR/processed_chunks/$CONGRESS" \
+  --output "$DATA_DIR/embedded_chunks/$CONGRESS"
 
 # ---------------------------------------------------------------------------
 # Step 5: Upsert

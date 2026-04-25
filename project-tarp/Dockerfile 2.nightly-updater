@@ -1,0 +1,29 @@
+# Use the existing amd64 upserter image as a local base so this can be built
+# even when Docker Hub metadata resolution is unavailable on the builder host.
+FROM csearch-upserter:latest
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DATA_DIR=/app/data \
+    CONGRESS_DATA_ROOT=/congress-data
+
+# csearch-upserter already includes bash, ca-certificates, and psycopg2.
+RUN pip install --no-cache-dir \
+    aiohttp \
+    tiktoken \
+    openai
+
+WORKDIR /app
+
+COPY fetcher.py \
+     chunker.py \
+     embedder.py \
+     upserter.py \
+     content_hasher.py \
+     nightly_update.sh \
+     ./
+
+RUN chmod a+r fetcher.py chunker.py embedder.py upserter.py content_hasher.py nightly_update.sh \
+    && chmod a+rx nightly_update.sh
+
+ENTRYPOINT ["bash", "nightly_update.sh"]

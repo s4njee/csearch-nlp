@@ -58,7 +58,7 @@ HEADERS = {
     "User-Agent": "project-tarp/0.1 (congressional research; contact: sanjee.yogeswaran@gmail.com)",
 }
 
-RATE_LIMIT_SECONDS = 0.35  # ~3 req/s
+RATE_LIMIT_SECONDS = 0.15  # ~7 req/s — GovInfo handles this comfortably
 
 # Strings that indicate a GovInfo soft-404 (HTTP 200 but error page body)
 ERROR_SIGNATURES = [
@@ -263,17 +263,30 @@ async def fetch_bill_text(
         url = build_url(congress, btype, number, versions[0])
         return {"bill_id": bill_id, "status": "dry_run", "url_sample": url, "versions": versions}
 
-    # Try each version: xml first (has section structure), then html, text
-    for version in versions:
-        for fmt in ["xml", "html", "text"]:
+    # Track consecutive misses to bail early — if the first 2 versions all
+    # return error pages, the bill almost certainly has no text on GovInfo.
+    consecutive_misses = 0
+    MISS_BAIL_THRESHOLD = 2
+
+    # Try each version: xml first (has section structure), then html, text.
+    # Optimisation: only try xml for the first version. If GovInfo has the bill
+    # at all it almost always has the xml. Falling through to html/text for
+    # every version wastes 2 extra rate-limited requests per miss.
+    for vi, version in enumerate(versions):
+        formats = ["xml", "html", "text"] if vi == 0 else ["xml"]
+        for fmt in formats:
             url = build_url(congress, btype, number, version, fmt)
             try:
                 content = await fetch_content(session, url, timeout=timeout, rate_limiter=rate_limiter)
 
                 if is_error_page(content):
+                    consecutive_misses += 1
+                    if consecutive_misses >= MISS_BAIL_THRESHOLD:
+                        return {"bill_id": bill_id, "status": "not_found", "reason": "early bail after consecutive misses"}
                     continue
 
                 # Valid content — write it
+                consecutive_misses = 0
                 _, ext = FORMAT_MAP[fmt]
                 out_file = output_dir / btype / f"{btype}{number}.{ext}"
                 out_file.parent.mkdir(parents=True, exist_ok=True)
