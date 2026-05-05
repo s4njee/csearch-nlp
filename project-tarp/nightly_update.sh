@@ -20,6 +20,11 @@ LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
 exec > >(tee "$LOG_DIR/update-$DATE.log") 2>&1
 
+# Sentinel cleared at the start of every run; touched only after a successful
+# upsert so the orchestrator can decide whether to trigger a frontend redeploy.
+DEPLOY_SENTINEL="$DATA_DIR/.deploy-pending"
+rm -f "$DEPLOY_SENTINEL"
+
 echo "========================================================"
 echo "  CSearch NLP nightly update — Congress $CONGRESS"
 echo "  $(date)"
@@ -85,6 +90,9 @@ python upserter.py \
   --input "$DATA_DIR/embedded_chunks/$CONGRESS" \
   --skip-hnsw \
   --batch-size 2000
+
+# Mark that real content was written, so the orchestrator triggers a redeploy.
+touch "$DEPLOY_SENTINEL"
 
 echo ""
 echo "========================================================"
