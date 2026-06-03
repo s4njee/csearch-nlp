@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: csearch-nlp-query-shell
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/s4njee/csearch-nlp.git
+    targetRevision: HEAD
+    path: k8s/query-shell
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: csearch-nlp
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
