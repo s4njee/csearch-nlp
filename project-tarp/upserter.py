@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
@@ -374,6 +375,32 @@ def ensure_vote_schema(conn, schema: str, chunk_table: str, embedding_table: str
             cur.execute(sql)
 
 
+def validate_schema(conn, schema: str, chunk_table: str, embedding_table: str) -> None:
+    """Fail loudly if the target tables are missing.
+
+    The loader no longer creates production tables opportunistically; the schema
+    is owned by db/migrations. This catches the case where someone points the
+    loader at a database that has not been migrated, instead of silently
+    creating divergent tables.
+    """
+    with conn.cursor() as cur:
+        for table in (chunk_table, embedding_table):
+            cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+            if cur.fetchone()[0] is None:
+                raise RuntimeError(
+                    f"Required table {schema}.{table} is missing. Apply migrations first "
+                    f"(python db/migrate.py), or pass --ensure-schema to bootstrap a fresh database."
+                )
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def ensure_embedding_dimensions(conn, schema: str, embedding_table: str, vector_size: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -493,36 +520,117 @@ def stage_vote_shard(cur, rows: list[tuple], batch_size: int) -> None:
     )
 
 
-def replace_shard(conn, schema: str, chunk_table: str, embedding_table: str, shard_rows: list[tuple], batch_size: int) -> None:
+def replace_shard(
+    conn,
+    schema: str,
+    chunk_table: str,
+    embedding_table: str,
+    shard_rows: list[tuple],
+    batch_size: int,
+    force_replace: bool = False,
+) -> None:
+    """Load a shard of bill chunk rows into the database.
+
+    Strategy (§8 docs/CRITICISMS2.md — reduce write amplification):
+      - When the staged chunk count for each bill matches the live count AND
+        force_replace is False, use INSERT … ON CONFLICT DO UPDATE to update
+        only changed fields without deleting live rows, so the HNSW graph is
+        not churned unnecessarily.
+      - When the staged count differs from the live count (chunks were added or
+        removed for a bill) or force_replace is True, fall back to the original
+        DELETE + reinsert path so orphaned chunks are cleaned up.
+    """
     if not shard_rows:
         return
 
     bill_ids = sorted({row[1] for row in shard_rows if row[1]})
+    # Staged chunk count per bill from the incoming rows.
+    staged_counts: dict[str, int] = {}
+    for row in shard_rows:
+        bid = row[1]
+        if bid:
+            staged_counts[bid] = staged_counts.get(bid, 0) + 1
+
     with conn:
         with conn.cursor() as cur:
             stage_shard(cur, shard_rows, batch_size=batch_size)
-            cur.execute(
-                f"DELETE FROM {schema}.{chunk_table} WHERE bill_id = ANY(%s)",
-                (bill_ids,),
-            )
-            cur.execute(
-                f"""
-                INSERT INTO {schema}.{chunk_table} (
-                  source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
-                  chunk_type, section_path, title, body, token_count, source_version, status,
-                  section_enum, section_header, chunk_index, original_chunk_index,
-                  document_text_hash, section_text_hash, document_text_hashes,
-                  document_aliases, section_aliases
+
+            if not force_replace:
+                # Check live chunk counts to decide per-bill strategy.
+                cur.execute(
+                    f"SELECT bill_id, COUNT(*) FROM {schema}.{chunk_table} "
+                    f"WHERE bill_id = ANY(%s) GROUP BY bill_id",
+                    (bill_ids,),
                 )
-                SELECT
-                  source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
-                  chunk_type, section_path, title, body, token_count, source_version, status,
-                  section_enum, section_header, chunk_index, original_chunk_index,
-                  document_text_hash, section_text_hash, document_text_hashes,
-                  document_aliases, section_aliases
-                FROM staging_bill_chunks
-                """
-            )
+                live_counts: dict[str, int] = {r[0]: r[1] for r in cur.fetchall()}
+                # Bills whose count changed need a clean replace.
+                replace_bills = [
+                    bid for bid in bill_ids
+                    if staged_counts.get(bid, 0) != live_counts.get(bid, 0)
+                ]
+                upsert_bills = [bid for bid in bill_ids if bid not in replace_bills]
+            else:
+                replace_bills = bill_ids
+                upsert_bills = []
+
+            # DELETE + reinsert for bills with structural chunk changes.
+            if replace_bills:
+                cur.execute(
+                    f"DELETE FROM {schema}.{chunk_table} WHERE bill_id = ANY(%s)",
+                    (replace_bills,),
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.{chunk_table} (
+                      source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
+                      chunk_type, section_path, title, body, token_count, source_version, status,
+                      section_enum, section_header, chunk_index, original_chunk_index,
+                      document_text_hash, section_text_hash, document_text_hashes,
+                      document_aliases, section_aliases
+                    )
+                    SELECT
+                      source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
+                      chunk_type, section_path, title, body, token_count, source_version, status,
+                      section_enum, section_header, chunk_index, original_chunk_index,
+                      document_text_hash, section_text_hash, document_text_hashes,
+                      document_aliases, section_aliases
+                    FROM staging_bill_chunks
+                    WHERE bill_id = ANY(%s)
+                    """,
+                    (replace_bills,),
+                )
+
+            # Upsert-in-place for bills with the same chunk count (no structural change).
+            if upsert_bills:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.{chunk_table} (
+                      source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
+                      chunk_type, section_path, title, body, token_count, source_version, status,
+                      section_enum, section_header, chunk_index, original_chunk_index,
+                      document_text_hash, section_text_hash, document_text_hashes,
+                      document_aliases, section_aliases
+                    )
+                    SELECT
+                      source_hash, bill_id, canonical_bill_id, congress, bill_type, bill_number,
+                      chunk_type, section_path, title, body, token_count, source_version, status,
+                      section_enum, section_header, chunk_index, original_chunk_index,
+                      document_text_hash, section_text_hash, document_text_hashes,
+                      document_aliases, section_aliases
+                    FROM staging_bill_chunks
+                    WHERE bill_id = ANY(%s)
+                    ON CONFLICT (source_hash) DO UPDATE SET
+                      body               = EXCLUDED.body,
+                      title              = EXCLUDED.title,
+                      status             = EXCLUDED.status,
+                      document_text_hash = EXCLUDED.document_text_hash,
+                      section_text_hash  = EXCLUDED.section_text_hash,
+                      updated_at         = now()
+                    """,
+                    (upsert_bills,),
+                )
+
+            # Embeddings: always upsert (existing ON CONFLICT handles both paths).
             cur.execute(
                 f"""
                 INSERT INTO {schema}.{embedding_table} (chunk_id, embedding, model)
@@ -535,6 +643,10 @@ def replace_shard(conn, schema: str, chunk_table: str, embedding_table: str, sha
                       model = EXCLUDED.model
                 """,
                 (bill_ids,),
+            )
+            log.debug(
+                "shard loaded: %d bills (%d delete+reinsert, %d upsert-in-place)",
+                len(bill_ids), len(replace_bills), len(upsert_bills),
             )
 
 
@@ -657,9 +769,82 @@ def verify_counts(conn, schema: str, chunk_table: str, embedding_table: str) -> 
     log.info(f"{'=' * 60}")
     log.info(f"Verification: {chunks:,} chunks | {embeddings:,} embeddings")
     if chunks != embeddings:
-        log.warning(f"Count mismatch — {chunks - embeddings:,} chunks are missing embeddings")
-    else:
-        log.info("Counts match")
+        raise RuntimeError(
+            f"Integrity check failed: {chunks:,} chunks but {embeddings:,} embeddings "
+            f"({chunks - embeddings:,} chunks missing embeddings)."
+        )
+    log.info("Counts match")
+
+
+# ---------------------------------------------------------------------------
+# Run audit + manifest (pipeline integrity)
+# ---------------------------------------------------------------------------
+
+def record_run_start(dsn: str, run_id: str, fields: dict) -> None:
+    """Best-effort 'running' audit row, on its own autocommit connection.
+
+    Written independently of the load transaction so the row survives a crash
+    and a partial/failed run is distinguishable from a healthy one. Never raises:
+    a missing nlp.ingest_runs table (un-migrated DB) only logs a warning.
+    """
+    try:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nlp.ingest_runs
+                  (run_id, git_sha, congress, source_root, status, embedding_model, embedding_dimensions)
+                VALUES (%s, %s, %s, %s, 'running', %s, %s)
+                ON CONFLICT (run_id) DO UPDATE
+                  SET status = 'running', started_at = now(), finished_at = NULL, error = NULL
+                """,
+                (run_id, fields.get("git_sha") or None, fields.get("congress"),
+                 fields.get("source_root"), fields.get("embedding_model"), fields.get("embedding_dimensions")),
+            )
+        conn.close()
+    except Exception as e:  # noqa: BLE001 - audit must never break the load
+        log.warning(f"Could not record ingest run start: {e}")
+
+
+def record_run_finish(dsn: str, run_id: str, status: str, manifest: dict, error: str | None = None) -> None:
+    try:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nlp.ingest_runs SET
+                  status = %s,
+                  finished_at = now(),
+                  input_bill_count = %s,
+                  changed_bill_count = %s,
+                  chunk_count = %s,
+                  token_count = %s,
+                  shard_count = %s,
+                  shard_checksums = %s,
+                  upserted_chunk_count = %s,
+                  error = %s
+                WHERE run_id = %s
+                """,
+                (status, manifest.get("input_bill_count"), manifest.get("changed_bill_count"),
+                 manifest.get("chunk_count"), manifest.get("token_count"), manifest.get("shard_count"),
+                 Json(manifest.get("shard_checksums", {})), manifest.get("upserted_chunk_count"),
+                 error, run_id),
+            )
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Could not record ingest run finish: {e}")
+
+
+def write_manifest(manifest_dir: Path, run_id: str, manifest: dict) -> None:
+    try:
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        path = manifest_dir / f"{run_id}.json"
+        path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        log.info(f"Wrote run manifest: {path}")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Could not write run manifest: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +889,17 @@ def main():
                         help="Include document_aliases and section_aliases in stored chunk rows")
     parser.add_argument("--recreate", action="store_true",
                         help="Drop and recreate tables before loading")
+    parser.add_argument("--ensure-schema", action="store_true",
+                        help="Create the schema/tables if missing (bootstrap only). By default the "
+                             "loader VALIDATES the schema and fails if it is absent — run migrations first.")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Identifier for this ingest run (default: utc timestamp). Recorded in nlp.ingest_runs.")
+    parser.add_argument("--git-sha", type=str, default=os.environ.get("GIT_SHA", ""),
+                        help="Source git SHA to record in the run manifest (default: $GIT_SHA)")
+    parser.add_argument("--manifest-dir", type=str, default=None,
+                        help="Directory to write the JSON run manifest into (default: <data>/manifests)")
+    parser.add_argument("--no-audit", action="store_true",
+                        help="Do not write the nlp.ingest_runs audit row or JSON manifest")
     parser.add_argument("--dry-run", action="store_true",
                         help="Scan and validate shards without touching PostgreSQL")
     args = parser.parse_args()
@@ -752,13 +948,44 @@ def main():
     if args.create_db:
         create_database_if_not_exists(args.dsn)
 
+    # Run accounting (pipeline integrity). Schema ownership lives in
+    # db/migrations; this run is audited so a partial load is never silent.
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest_dir = Path(args.manifest_dir) if args.manifest_dir else DATA_DIR / "manifests"
+    audit_enabled = not args.no_audit and not args.dry_run and not args.index_only
+    shard_checksums = {p.name: sha256_file(p) for p in shard_paths} if not args.index_only else {}
+    all_bill_ids: set[str] = set()
+    manifest = {
+        "run_id": run_id,
+        "git_sha": args.git_sha,
+        "congress": None,
+        "source_root": str(input_path),
+        "embedding_model": args.model,
+        "embedding_dimensions": args.vector_size,
+        "shard_count": len(shard_paths) if not args.index_only else 0,
+        "shard_checksums": shard_checksums,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if audit_enabled:
+        record_run_start(args.dsn, run_id, {
+            "git_sha": args.git_sha,
+            "congress": None,
+            "source_root": str(input_path),
+            "embedding_model": args.model,
+            "embedding_dimensions": args.vector_size,
+        })
+
     conn = psycopg2.connect(args.dsn)
     try:
-        # Schema setup
-        if args.mode == "votes":
-            ensure_vote_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
+        # Schema setup. Validate by default; only create when explicitly
+        # bootstrapping a fresh database (--ensure-schema or --recreate).
+        if args.recreate or args.ensure_schema:
+            if args.mode == "votes":
+                ensure_vote_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
+            else:
+                ensure_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
         else:
-            ensure_schema(conn, args.schema, args.chunk_table, args.embedding_table, args.vector_size, args.recreate)
+            validate_schema(conn, args.schema, args.chunk_table, args.embedding_table)
         ensure_embedding_dimensions(conn, args.schema, args.embedding_table, args.vector_size)
         conn.commit()
 
@@ -797,6 +1024,7 @@ def main():
                 ]
             total_chunks += len(shard_rows)
             total_tokens += shard_tokens
+            all_bill_ids.update(row[1] for row in shard_rows if row[1])
             log.info(f"  {len(shard_rows)} rows, {shard_tokens:,} tokens")
 
             if args.dry_run:
@@ -845,9 +1073,28 @@ def main():
                 args.max_parallel_maintenance_workers,
             )
 
-        # Verify
+        # Verify (raises if chunk/embedding counts diverge)
         verify_counts(conn, args.schema, args.chunk_table, args.embedding_table)
 
+        manifest.update({
+            "input_bill_count": len(all_bill_ids),
+            "changed_bill_count": len(all_bill_ids),
+            "chunk_count": total_chunks,
+            "token_count": total_tokens,
+            "upserted_chunk_count": upserted,
+            "status": "success",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        if audit_enabled:
+            record_run_finish(args.dsn, run_id, "success", manifest)
+            write_manifest(manifest_dir, run_id, manifest)
+    except Exception as exc:
+        if audit_enabled:
+            manifest.update({"status": "failed", "error": str(exc),
+                             "finished_at": datetime.now(timezone.utc).isoformat()})
+            record_run_finish(args.dsn, run_id, "failed", manifest, error=str(exc))
+            write_manifest(manifest_dir, run_id, manifest)
+        raise
     finally:
         conn.close()
 
