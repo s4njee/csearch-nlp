@@ -91,6 +91,19 @@ python upserter.py \
   --skip-hnsw \
   --batch-size 2000
 
+# Promote the hash manifest now that fetch -> chunk -> embed -> upsert all
+# succeeded (set -e means we only reach this line on success). content_hasher
+# writes a .pending manifest; promoting it here — instead of inside
+# content_hasher — guarantees a failed run leaves the authoritative manifest
+# untouched, so the same bills are retried next run rather than stranded with
+# their hashes recorded but their embeddings missing.
+PENDING_MANIFEST="$DATA_DIR/hash_manifests/$CONGRESS.pending.json"
+AUTH_MANIFEST="$DATA_DIR/hash_manifests/$CONGRESS.json"
+if [ -f "$PENDING_MANIFEST" ]; then
+  mv -f "$PENDING_MANIFEST" "$AUTH_MANIFEST"
+  echo "Promoted hash manifest -> $AUTH_MANIFEST"
+fi
+
 # Mark that real content was written, so the orchestrator triggers a redeploy.
 touch "$DEPLOY_SENTINEL"
 

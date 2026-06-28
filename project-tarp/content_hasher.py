@@ -136,6 +136,14 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     bills_dir = data_dir / f"bills_{args.congress}"
     manifest_path = data_dir / "hash_manifests" / f"{args.congress}.json"
+    # The authoritative manifest must only advance after the bills are actually
+    # embedded. We compare against it (read) but write the new hashes to a
+    # *pending* file; the orchestrator promotes pending -> authoritative only after
+    # a successful upsert. Writing the authoritative manifest here (before the
+    # embed) is what previously stranded fetched-but-unembedded bills whenever a
+    # downstream stage failed: their hashes were recorded, so every later run saw
+    # "0 changed" and skipped them forever.
+    pending_path = data_dir / "hash_manifests" / f"{args.congress}.pending.json"
 
     if not bills_dir.exists():
         log.error(f"Bills directory not found: {bills_dir}")
@@ -193,8 +201,11 @@ def main() -> int:
         f"{len(unchanged)} unchanged, {len(new_manifest)} total"
     )
 
-    save_manifest(manifest_path, new_manifest)
-    log.info(f"Hash manifest updated: {manifest_path}")
+    save_manifest(pending_path, new_manifest)
+    log.info(
+        f"Pending hash manifest written: {pending_path} "
+        "(promoted to authoritative only after a successful upsert)"
+    )
 
     if changed:
         log.info(f"Changes detected — pipeline should proceed")
