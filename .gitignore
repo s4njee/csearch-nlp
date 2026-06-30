@@ -6,6 +6,7 @@ project-tarp/data/
 *.json
 !package.json
 !package-lock.json
+!eval/eval_set.json  # checked-in retrieval-eval fixture (CI smoke depends on it)
 
 # Python
 __pycache__/
