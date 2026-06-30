@@ -1,0 +1,51 @@
+{
+  "description": "Retrieval evaluation set for CSearch semantic search. Curate toward the target mix below; expected_bill_ids use the nlp.bill_chunks bill_id form '<type><number>-<congress>'. The two fixture entries are runnable against db/seed/fixtures.sql with the deterministic fake embedding provider.",
+  "target_mix": {
+    "policy_natural_language": 50,
+    "exact_bill_or_title": 25,
+    "sponsor_committee_procedure": 25
+  },
+  "queries": [
+    {
+      "id": "fixture-policy-broadband",
+      "category": "policy_natural_language",
+      "query": "expanding internet access in rural communities",
+      "expected_bill_ids": ["hr42-119"],
+      "unacceptable_bill_ids": [],
+      "fixture": true
+    },
+    {
+      "id": "fixture-policy-water",
+      "category": "policy_natural_language",
+      "query": "protecting clean drinking water",
+      "expected_bill_ids": ["s100-119"],
+      "unacceptable_bill_ids": [],
+      "fixture": true
+    },
+    {
+      "id": "policy-prescription-drug-pricing",
+      "category": "policy_natural_language",
+      "query": "lowering the cost of prescription drugs for seniors",
+      "expected_bill_ids": [],
+      "unacceptable_bill_ids": [],
+      "fixture": false
+    },
+    {
+      "id": "exact-hr42",
+      "category": "exact_bill_or_title",
+      "query": "HR 42",
+      "expected_bill_ids": ["hr42-119"],
+      "unacceptable_bill_ids": [],
+      "fixture": true,
+      "note": "Should be served by exact routing, not the embedding model."
+    },
+    {
+      "id": "sponsor-example",
+      "category": "sponsor_committee_procedure",
+      "query": "bills sponsored by Jane Doe",
+      "expected_bill_ids": ["hr42-119"],
+      "unacceptable_bill_ids": [],
+      "fixture": true
+    }
+  ]
+}
