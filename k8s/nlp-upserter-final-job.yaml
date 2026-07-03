@@ -20,8 +20,12 @@ spec:
           imagePullPolicy: Never
           args:
             - "--index-only"
+            # maintenance_work_mem is charged to the Postgres pod (3Gi limit),
+            # not this Job — 10GB there would OOM the index build. Keep it under
+            # the DB pod's limit; pgvector falls back to an on-disk build if the
+            # HNSW graph doesn't fit, so this only slows the rebuild, not breaks it.
             - "--maintenance-work-mem"
-            - "10GB"
+            - "1GB"
             - "--max-parallel-maintenance-workers"
             - "1"
           env:

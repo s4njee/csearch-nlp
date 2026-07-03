@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -553,17 +554,88 @@ def save_manifest(output_root: Path, summary: dict) -> None:
     log.info(f"Manifest saved: {manifest_path}")
 
 
-def collect_pending_chunks(input_path: Path, output_path: Path, shard_paths: list[Path]) -> tuple[list[dict], int, int, int, list[dict]]:
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_completed_shard_manifest(
+    output_root: Path,
+    expected_model: Optional[str] = None,
+    expected_dimensions: Optional[int] = None,
+) -> dict[str, dict]:
+    manifest_path = output_root / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        manifest = load_json(manifest_path)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if expected_model is not None and manifest.get("model") != expected_model:
+        return {}
+    if expected_dimensions is not None and manifest.get("dimensions") != expected_dimensions:
+        return {}
+
+    completed = {}
+    for status in manifest.get("shards", []):
+        if status.get("to_embed") != 0:
+            continue
+        shard_key = status.get("input_shard_rel") or status.get("input_shard")
+        if shard_key and status.get("input_sha256"):
+            completed[str(shard_key)] = status
+    return completed
+
+
+def collect_pending_chunks(
+    input_path: Path,
+    output_path: Path,
+    shard_paths: list[Path],
+    expected_model: Optional[str] = None,
+    expected_dimensions: Optional[int] = None,
+) -> tuple[list[dict], int, int, int, list[dict]]:
     """Return pending chunks with shard context plus aggregate counts."""
     pending = []
     total_chunks = 0
     total_tokens = 0
     total_already_done = 0
     shard_statuses = []
+    completed_manifest = load_completed_shard_manifest(
+        output_path,
+        expected_model=expected_model,
+        expected_dimensions=expected_dimensions,
+    )
 
     for shard_path in shard_paths:
+        output_shard = shard_output_path(input_path, output_path, shard_path)
+        shard_rel = str(shard_path.relative_to(input_path)) if input_path.is_dir() else shard_path.name
+        input_sha256 = sha256_file(shard_path)
+        previous_status = completed_manifest.get(shard_rel) or completed_manifest.get(str(shard_path))
+        if (
+            previous_status
+            and previous_status.get("input_sha256") == input_sha256
+            and output_shard.exists()
+        ):
+            shard_total = int(previous_status.get("chunk_count", 0))
+            total_chunks += shard_total
+            total_already_done += shard_total
+            shard_statuses.append({
+                "input_shard": str(shard_path),
+                "input_shard_rel": shard_rel,
+                "output_shard": str(output_shard),
+                "input_sha256": input_sha256,
+                "chunk_count": shard_total,
+                "already_embedded": shard_total,
+                "to_embed": 0,
+                "skipped_by_manifest": True,
+            })
+            continue
+
         input_chunks = read_jsonl(shard_path)
-        existing_by_key = load_existing_shard(shard_output_path(input_path, output_path, shard_path))
+        existing_by_key = load_existing_shard(output_shard)
         shard_total = len(input_chunks)
         shard_pending = [chunk for chunk in input_chunks if chunk_identity(chunk) not in existing_by_key]
         shard_pending_tokens = sum(chunk_token_count(chunk) for chunk in shard_pending)
@@ -573,13 +645,14 @@ def collect_pending_chunks(input_path: Path, output_path: Path, shard_paths: lis
         total_already_done += shard_total - len(shard_pending)
         shard_statuses.append({
             "input_shard": str(shard_path),
-            "output_shard": str(shard_output_path(input_path, output_path, shard_path)),
+            "input_shard_rel": shard_rel,
+            "output_shard": str(output_shard),
+            "input_sha256": input_sha256,
             "chunk_count": shard_total,
             "already_embedded": shard_total - len(shard_pending),
             "to_embed": len(shard_pending),
         })
 
-        shard_rel = str(shard_path.relative_to(input_path)) if input_path.is_dir() else shard_path.name
         for chunk in shard_pending:
             pending.append({
                 **chunk,
@@ -700,7 +773,13 @@ def run_openai_batch_backend(client: OpenAI, args, input_path: Path, output_path
                     state_path.unlink()
                     time.sleep(backoff)
                     # Fall through to resubmit below
-                    pending_chunks, _, _, _, shard_statuses[:] = collect_pending_chunks(input_path, output_path, shard_paths)
+                    pending_chunks, _, _, _, shard_statuses[:] = collect_pending_chunks(
+                        input_path,
+                        output_path,
+                        shard_paths,
+                        expected_model=args.model,
+                        expected_dimensions=args.dimensions,
+                    )
                 else:
                     log.error(f"Gave up after {args.max_retries} enqueued-limit retries")
                     history_path = batch_history_dir(output_path) / f"{Path(batch_state['batch_dir']).name}.json"
@@ -713,7 +792,13 @@ def run_openai_batch_backend(client: OpenAI, args, input_path: Path, output_path
                 save_json(history_path, batch_state)
                 state_path.unlink()
 
-                pending_chunks, _, _, _, shard_statuses[:] = collect_pending_chunks(input_path, output_path, shard_paths)
+                pending_chunks, _, _, _, shard_statuses[:] = collect_pending_chunks(
+                    input_path,
+                    output_path,
+                    shard_paths,
+                    expected_model=args.model,
+                    expected_dimensions=args.dimensions,
+                )
                 if not pending_chunks:
                     _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
                     return total_embedded_now
@@ -806,7 +891,7 @@ def run_openai_batch_backend(client: OpenAI, args, input_path: Path, output_path
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Embed text chunks via OpenAI or Ollama")
     parser.add_argument("--input", "--input-dir", dest="input", type=str, default=str(INPUT_FILE),
                         help=f"Input chunk shard directory (default: {INPUT_FILE})")
@@ -852,27 +937,29 @@ def main():
     if not input_path.exists():
         log.error(f"Input path not found: {input_path}")
         log.error("Run chunker.py first to generate processed chunk shards")
-        return
+        return 1
 
     try:
         shard_paths = iter_input_shards(input_path)
     except ValueError as e:
         log.error(str(e))
-        return
+        return 1
 
     if not shard_paths:
         log.error(f"No input shard files found under {input_path}")
-        return
+        return 1
 
     pending_chunks, total_chunks, total_tokens, total_already_done, shard_statuses = collect_pending_chunks(
         input_path,
         output_path,
         shard_paths,
+        expected_model=args.model,
+        expected_dimensions=args.dimensions,
     )
 
     if total_chunks == 0:
         log.info("No chunks found. Nothing to do.")
-        return
+        return 0
 
     log.info(f"Discovered {len(shard_paths)} shard(s) with {total_chunks} chunk(s) total")
     log.info(f"Need to embed: {total_chunks - total_already_done} chunks ({total_already_done} already done)")
@@ -887,17 +974,17 @@ def main():
 
     if args.dry_run:
         log.info(f"[DRY RUN] Exiting without calling {args.backend}")
-        return
+        return 0
 
     client = None
     if args.backend in {"openai", "openai-batch"}:
         if OpenAI is None:
             log.error("openai package not installed. Run: pip install openai")
-            return
+            return 1
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             log.error("OPENAI_API_KEY environment variable not set")
-            return
+            return 1
         client = OpenAI(api_key=api_key)
     else:
         if args.dimensions is not None:
@@ -918,7 +1005,20 @@ def main():
         log.info(f"{'=' * 60}")
         log.info(f"Batch mode progress applied in this run: {total_embedded_now} embeddings merged")
         log.info(f"Batch state directory: {batch_state_dir(output_path)}")
-        return
+        remaining_chunks, _, _, _, _ = collect_pending_chunks(
+            input_path,
+            output_path,
+            shard_paths,
+            expected_model=args.model,
+            expected_dimensions=args.dimensions,
+        )
+        if remaining_chunks:
+            log.error(
+                "OpenAI batch mode still has %s pending chunk(s); refusing to report success before all embeddings are merged",
+                len(remaining_chunks),
+            )
+            return 1
+        return 0
 
     current_output_shard = None
     current_input_chunks = None
@@ -946,7 +1046,7 @@ def main():
             except ValueError as e:
                 log.error(str(e))
                 _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
-                return
+                return 1
             log.info(
                 f"Shard {shard_index}/{len(shard_paths)}: {shard_path.name} | "
                 f"{len(to_embed)}/{len(input_chunks)} chunks to embed | "
@@ -995,7 +1095,7 @@ def main():
                             log.error(f"API error on shard {shard_index} batch {bi}: {e}")
                         write_jsonl(output_shard, build_shard_records(input_chunks, embedded_by_key))
                         _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
-                        return
+                        return 1
 
                 for chunk, vector in zip(batch, vectors):
                     updated = dict(chunk)
@@ -1024,12 +1124,13 @@ def main():
             write_jsonl(current_output_shard, build_shard_records(current_input_chunks, current_embedded_by_key))
         log.warning("Interrupted by user; partial shard progress has been checkpointed")
         _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
-        return
+        return 130
 
     _save_final_manifest(output_path, args, shard_statuses, total_embedded_now)
     log.info(f"{'=' * 60}")
     log.info(f"DONE: {total_embedded_now} chunks embedded in this run")
     log.info(f"Saved embedded shards under {output_path}")
+    return 0
 
 
 def _save_final_manifest(output_root: Path, args, shard_statuses: list[dict], embedded_now: int) -> None:
@@ -1051,4 +1152,4 @@ def _save_final_manifest(output_root: Path, args, shard_statuses: list[dict], em
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

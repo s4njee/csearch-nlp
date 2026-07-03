@@ -117,6 +117,19 @@ def save_manifest(manifest_path: Path, manifest: dict[str, str]) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def count_missing_embeddings(data_dir: Path, congress: int) -> tuple[int, int]:
+    """Return missing/total chunks from the embedder manifest without JSONL scans."""
+    manifest_path = data_dir / "embedded_chunks" / str(congress) / "manifest.json"
+    if not manifest_path.exists():
+        return 0, 0
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shards = manifest.get("shards", [])
+    missing = sum(int(shard.get("to_embed", 0) or 0) for shard in shards)
+    total = sum(int(shard.get("chunk_count", 0) or 0) for shard in shards)
+    return missing, total
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -144,6 +157,7 @@ def main() -> int:
     # downstream stage failed: their hashes were recorded, so every later run saw
     # "0 changed" and skipped them forever.
     pending_path = data_dir / "hash_manifests" / f"{args.congress}.pending.json"
+    changes_path = data_dir / "hash_manifests" / f"{args.congress}.changes.json"
 
     if not bills_dir.exists():
         log.error(f"Bills directory not found: {bills_dir}")
@@ -207,7 +221,31 @@ def main() -> int:
         "(promoted to authoritative only after a successful upsert)"
     )
 
-    if changed:
+    try:
+        missing_embeddings, processed_chunks = count_missing_embeddings(data_dir, args.congress)
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        log.warning(f"Could not inspect embedded chunk coverage: {exc}")
+        missing_embeddings, processed_chunks = 0, 0
+
+    if missing_embeddings:
+        log.warning(
+            "Detected %s/%s processed chunk(s) without embeddings — pipeline should proceed",
+            missing_embeddings,
+            processed_chunks,
+        )
+
+    save_manifest(changes_path, {
+        "congress": args.congress,
+        "changed_bill_ids": changed,
+        "changed_count": len(changed),
+        "unchanged_count": len(unchanged),
+        "total_count": len(new_manifest),
+        "missing_embedding_count": missing_embeddings,
+        "processed_chunk_count": processed_chunks,
+    })
+    log.info(f"Change manifest written: {changes_path}")
+
+    if changed or missing_embeddings:
         log.info(f"Changes detected — pipeline should proceed")
         return 0
     else:

@@ -62,8 +62,14 @@ DEFAULT_VECTOR_SIZE = 1536
 DEFAULT_MODEL = "text-embedding-3-small"
 DEFAULT_HNSW_M = 16
 DEFAULT_HNSW_EF_CONSTRUCTION = 128
-DEFAULT_MAINTENANCE_WORK_MEM = "16GB"
-DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS = 6
+# The HNSW CREATE INDEX runs *inside* Postgres, so maintenance_work_mem is
+# charged to the Postgres pod (limit 3Gi on both netcup and freya), not to this
+# upserter Job. Keep it well under that limit — shared_buffers, work_mem, and
+# connections also live in that 3Gi. pgvector degrades to an on-disk build if
+# the graph doesn't fit, so a low value only makes the (monthly) rebuild slower,
+# not wrong. See k8s/*/postgres-statefulset.yaml and docs/BACKLOG.md E3 §3.5.
+DEFAULT_MAINTENANCE_WORK_MEM = "1GB"
+DEFAULT_MAX_PARALLEL_MAINTENANCE_WORKERS = 1
 SHARD_NAME_RE = re.compile(r"^shard-\d{5}\.jsonl$")
 
 logging.basicConfig(
@@ -851,7 +857,7 @@ def write_manifest(manifest_dir: Path, run_id: str, manifest: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Load embedded chunk shards into PostgreSQL pgvector tables")
     parser.add_argument("--mode", choices=["bills", "votes"], default="bills",
                         help="Load bill or vote embedding tables (default: bills)")
@@ -906,7 +912,7 @@ def main():
 
     if not args.dsn:
         log.error("PostgreSQL DSN not provided. Set PG_CONNECTION_STRING or pass --dsn.")
-        return
+        return 1
 
     if args.input is None:
         args.input = str(INPUT_DIR if args.mode == "bills" else DATA_DIR / "embedded_vote_chunks")
@@ -920,17 +926,17 @@ def main():
     if not args.index_only:
         if not input_path.exists():
             log.error(f"Input path not found: {input_path}")
-            return
+            return 1
 
         try:
             shard_paths = iter_embedded_shards(input_path)
         except ValueError as e:
             log.error(str(e))
-            return
+            return 1
 
         if not shard_paths:
             log.error(f"No embedded shard files found under {input_path}")
-            return
+            return 1
 
     mode = "index-only" if args.index_only else "full-load"
     log.info(
@@ -1003,7 +1009,7 @@ def main():
                     args.max_parallel_maintenance_workers,
                 )
             verify_counts(conn, args.schema, args.chunk_table, args.embedding_table)
-            return
+            return 0
 
         # Scan and load one shard at a time to keep memory bounded.
         upserted = 0
@@ -1056,7 +1062,7 @@ def main():
 
         if args.dry_run:
             log.info("[DRY RUN] Exiting without touching PostgreSQL")
-            return
+            return 0
 
         log.info(f"{'=' * 60}")
         log.info(f"Load complete: {upserted:,} chunks into {args.schema}.{args.chunk_table}")
@@ -1088,6 +1094,7 @@ def main():
         if audit_enabled:
             record_run_finish(args.dsn, run_id, "success", manifest)
             write_manifest(manifest_dir, run_id, manifest)
+        return 0
     except Exception as exc:
         if audit_enabled:
             manifest.update({"status": "failed", "error": str(exc),
@@ -1100,4 +1107,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

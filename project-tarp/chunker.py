@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -46,8 +47,8 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-DATA_BASE = Path(__file__).resolve().parent / "data"
-OUTPUT_DIR = Path(__file__).resolve().parent / "data"
+DATA_BASE = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent / "data"))
+OUTPUT_DIR = DATA_BASE
 SHARD_OUTPUT_DIR = OUTPUT_DIR / "processed_chunks"
 
 MAX_TOKENS = 512
@@ -644,6 +645,52 @@ def iter_meta_files(bills_dir: Path) -> list[Path]:
     )
 
 
+def load_bill_ids(path: Path) -> set[str]:
+    """Load changed bill IDs from a JSON list or content_hasher change manifest."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return {str(item) for item in payload}
+    if isinstance(payload, dict):
+        return {str(item) for item in payload.get("changed_bill_ids", [])}
+    raise ValueError(f"Unsupported bill-id manifest format: {path}")
+
+
+def bill_id_meta_path(bills_dir: Path, bill_id: str) -> Path | None:
+    match = re.fullmatch(r"([a-z]+)(\d+)-(\d+)", bill_id.lower())
+    if not match:
+        return None
+    btype, number, congress = match.groups()
+    if congress != bills_dir.name.split("_", 1)[1]:
+        return None
+    return bills_dir / btype / f"{btype}{number}.meta.json"
+
+
+def meta_files_for_bill_ids(bills_dir: Path, bill_ids: set[str]) -> list[Path]:
+    """Resolve bill IDs to metadata files without scanning the whole congress."""
+    paths = []
+    missing = []
+    for bill_id in sorted(bill_ids):
+        path = bill_id_meta_path(bills_dir, bill_id)
+        if path is not None and path.exists():
+            paths.append(path)
+        else:
+            missing.append(bill_id)
+    if missing:
+        # A changed bill we can't resolve to a meta file must NOT be silently
+        # dropped: the run would still succeed and promote the hash manifest,
+        # marking that bill "done" though it was never embedded. Degrade to a
+        # full-congress scan so every changed bill is processed; the (rare)
+        # cost is one non-incremental run, loudly flagged.
+        log.error(
+            "Could not resolve %s of %s changed bill(s) to a metadata file "
+            "(e.g. %s) — falling back to a full-congress scan so no changed "
+            "bill is skipped.",
+            len(missing), len(bill_ids), ", ".join(missing[:5]),
+        )
+        return iter_meta_files(bills_dir)
+    return paths
+
+
 def apply_chunk_filters(chunks: list[dict], min_tokens: int, cap: int) -> tuple[list[dict], int, int]:
     """Apply global minimum-token and per-canonical-bill chunk cap filters."""
     before = len(chunks)
@@ -733,9 +780,10 @@ def write_congress_shards(
     stats: dict,
     shard_bill_limit: int,
     shard_chunk_limit: int,
+    output_root: Path,
 ) -> dict:
     """Write one congress of canonical chunks to rolling JSONL shards and a manifest."""
-    congress_dir = SHARD_OUTPUT_DIR / str(congress_num)
+    congress_dir = output_root / str(congress_num)
     congress_dir.mkdir(parents=True, exist_ok=True)
 
     for path in congress_dir.glob("shard-*.jsonl"):
@@ -809,9 +857,15 @@ def write_congress_shards(
     return manifest_output
 
 
-def process_congress(bills_dir: Path, max_tokens: int, overlap: int, limit: int = 0) -> tuple[list[dict], dict]:
+def process_congress(
+    bills_dir: Path,
+    max_tokens: int,
+    overlap: int,
+    limit: int = 0,
+    bill_ids: set[str] | None = None,
+) -> tuple[list[dict], dict]:
     """Process all downloaded bills in a congress directory."""
-    meta_files = iter_meta_files(bills_dir)
+    meta_files = meta_files_for_bill_ids(bills_dir, bill_ids) if bill_ids is not None else iter_meta_files(bills_dir)
     if limit > 0:
         meta_files = meta_files[:limit]
 
@@ -866,7 +920,16 @@ def main():
                         help=f"Soft chunk cap per JSONL shard, applied between bills (default: {DEFAULT_SHARD_CHUNKS})")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max bills to process per congress (0 = all)")
+    parser.add_argument("--bill-ids-file", type=str, default=None,
+                        help="JSON list or content_hasher change manifest of bill IDs to chunk")
+    parser.add_argument("--output-dir", type=str, default=str(SHARD_OUTPUT_DIR),
+                        help=f"Processed shard output root (default: {SHARD_OUTPUT_DIR})")
     args = parser.parse_args()
+
+    bill_ids = load_bill_ids(Path(args.bill_ids_file)) if args.bill_ids_file else None
+    output_root = Path(args.output_dir)
+    if bill_ids is not None:
+        log.info("Incremental chunking enabled for %s bill(s)", len(bill_ids))
 
     bill_dirs = find_bill_dirs()
     if args.congresses:
@@ -884,7 +947,7 @@ def main():
     for bills_dir in bill_dirs:
         congress_num = bills_dir.name.split("_")[1]
         log.info(f"Processing congress {congress_num}...")
-        chunks, stats = process_congress(bills_dir, args.max_tokens, args.overlap, args.limit)
+        chunks, stats = process_congress(bills_dir, args.max_tokens, args.overlap, args.limit, bill_ids=bill_ids)
         chunks, below_min, capped = apply_chunk_filters(chunks, min_tokens=30, cap=args.max_chunks_per_bill)
         log.info(
             "  → %s chunks | docs %s -> %s | dropped %s duplicate docs | dropped %s duplicate sections",
@@ -909,18 +972,19 @@ def main():
             stats=stats,
             shard_bill_limit=args.shard_bills,
             shard_chunk_limit=args.shard_chunks,
+            output_root=output_root,
         )
         total_chunks += len(chunks)
         total_shards += manifest["shard_count"]
         total_tokens += sum(chunk["tokens"] for chunk in chunks)
         canonical_bill_ids.update(chunk["canonical_bill_id"] for chunk in chunks)
-        log.info(f"  → wrote {manifest['shard_count']} shard(s) to {SHARD_OUTPUT_DIR / congress_num}")
+        log.info(f"  → wrote {manifest['shard_count']} shard(s) to {output_root / congress_num}")
 
     if total_chunks:
         token_values = []
         for bills_dir in bill_dirs:
             congress_num = bills_dir.name.split("_")[1]
-            manifest_path = SHARD_OUTPUT_DIR / congress_num / "manifest.json"
+            manifest_path = output_root / congress_num / "manifest.json"
             if not manifest_path.exists():
                 continue
             manifest = json.loads(manifest_path.read_text())
@@ -946,7 +1010,7 @@ def main():
         log.info(f"Tokens: min={min(token_values)}, avg={sum(token_values)//len(token_values)}, max={max(token_values)}")
         est_cost = total_tokens / 1_000_000 * 0.02
         log.info(f"Estimated embedding cost: ${est_cost:.4f}")
-    log.info(f"Saved JSONL shards under {SHARD_OUTPUT_DIR}")
+    log.info(f"Saved JSONL shards under {output_root}")
 
 
 if __name__ == "__main__":

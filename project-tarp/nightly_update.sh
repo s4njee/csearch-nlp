@@ -13,6 +13,7 @@ set -euo pipefail
 CONGRESS="${CONGRESS:-119}"
 CONGRESS_DATA_ROOT="${CONGRESS_DATA_ROOT:-/root/congress/data}"
 DATA_DIR="${DATA_DIR:-/app/data}"
+NLP_INCREMENTAL_MAX_BILLS="${NLP_INCREMENTAL_MAX_BILLS:-1000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATE=$(date +%Y-%m-%d)
 LOG_DIR="$DATA_DIR/logs"
@@ -60,13 +61,52 @@ if ! python content_hasher.py \
   exit 0
 fi
 
+CHANGES_MANIFEST="$DATA_DIR/hash_manifests/$CONGRESS.changes.json"
+read -r CHANGED_COUNT MISSING_EMBEDDING_COUNT < <(
+  python - "$CHANGES_MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+
+print(data.get("changed_count", 0), data.get("missing_embedding_count", 0))
+PY
+)
+
+PROCESSED_ROOT="$DATA_DIR/processed_chunks"
+EMBEDDED_ROOT="$DATA_DIR/embedded_chunks"
+CHUNKER_EXTRA_ARGS=()
+
+if [ "$CHANGED_COUNT" -gt 0 ] && [ "$CHANGED_COUNT" -le "$NLP_INCREMENTAL_MAX_BILLS" ]; then
+  echo "Using incremental NLP path for $CHANGED_COUNT changed bill(s)."
+  PROCESSED_ROOT="$DATA_DIR/processed_chunks_delta"
+  EMBEDDED_ROOT="$DATA_DIR/embedded_chunks_delta"
+  CHUNKER_EXTRA_ARGS=(--bill-ids-file "$CHANGES_MANIFEST")
+  # Delta dirs are per-run scratch. The chunker clears its own output, but the
+  # embedder does not — so wipe both for this congress, else the upserter (which
+  # globs the whole dir) would re-push bills left over from a previous delta run.
+  rm -rf "$PROCESSED_ROOT/$CONGRESS" "$EMBEDDED_ROOT/$CONGRESS"
+elif [ "$CHANGED_COUNT" -eq 0 ] && [ "$MISSING_EMBEDDING_COUNT" -gt 0 ]; then
+  echo "No new bill text changes; retrying existing processed chunks with missing embeddings."
+else
+  echo "Using full-congress NLP path ($CHANGED_COUNT changed bill(s), threshold $NLP_INCREMENTAL_MAX_BILLS)."
+fi
+
 # ---------------------------------------------------------------------------
 # Step 3: Chunk
-# Rechunks the full congress (fast, CPU-only, ~minutes).
+# Rechunks either the changed bills or the full congress for large backfills.
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- [3/4] Chunking ---"
-python chunker.py --congresses "$CONGRESS"
+if [ "$CHANGED_COUNT" -eq 0 ] && [ "$MISSING_EMBEDDING_COUNT" -gt 0 ]; then
+  echo "Skipping chunker; reusing $PROCESSED_ROOT/$CONGRESS."
+else
+  python chunker.py \
+    --congresses "$CONGRESS" \
+    --output-dir "$PROCESSED_ROOT" \
+    "${CHUNKER_EXTRA_ARGS[@]}"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Embed
@@ -76,8 +116,8 @@ python chunker.py --congresses "$CONGRESS"
 echo ""
 echo "--- [4/4] Embedding new chunks ---"
 python embedder.py \
-  --input "$DATA_DIR/processed_chunks/$CONGRESS" \
-  --output "$DATA_DIR/embedded_chunks/$CONGRESS"
+  --input "$PROCESSED_ROOT/$CONGRESS" \
+  --output "$EMBEDDED_ROOT/$CONGRESS"
 
 # ---------------------------------------------------------------------------
 # Step 5: Upsert
@@ -87,7 +127,7 @@ python embedder.py \
 echo ""
 echo "--- [5/5] Upserting into PostgreSQL ---"
 python upserter.py \
-  --input "$DATA_DIR/embedded_chunks/$CONGRESS" \
+  --input "$EMBEDDED_ROOT/$CONGRESS" \
   --skip-hnsw \
   --batch-size 2000
 
