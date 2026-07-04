@@ -189,13 +189,18 @@ def embed_new(chunks_by_hash: dict[str, dict], backend: str, model: str,
     return out
 
 
-def load_reusable_embeddings(cur, schema: str, bill_uids: list[str]) -> dict[str, tuple[str, str]]:
-    """source_hash -> (embedding text, model) for bills about to be replaced."""
-    if not bill_uids:
-        return {}
+def load_bill_embeddings(cur, schema: str, bill_uid: str) -> dict[str, tuple[str, str]]:
+    """source_hash -> (embedding text, model) for ONE bill about to be replaced.
+
+    Per-bill on purpose: preloading the whole replace-set OOMed at 3,793 bills
+    (~110K embeddings ≈ GBs as text) on the first real-corpus run. Memory must
+    stay O(bill), because bulk-convergence plans are legitimate (that first run
+    converged prod's heterogeneous historical corpus onto current chunker
+    parameters — replacing a third of all bills is a feature, not an anomaly).
+    """
     cur.execute(
         f"SELECT source_hash, embedding::text, embedding_model FROM {schema}.chunks"
-        " WHERE bill_uid = ANY(%s)", (bill_uids,))
+        " WHERE bill_uid = %s", (bill_uid,))
     return {h: (emb, model) for h, emb, model in cur}
 
 
@@ -224,17 +229,18 @@ def chunk_row(chunk: dict, h: str, embedding: str, model: str) -> tuple:
 
 
 def execute_plan(conn, schema: str, plan: dict, desired: dict[str, dict[str, dict]],
-                 new_embeddings: dict[str, list[float]],
-                 reusable: dict[str, tuple[str, str]], model: str) -> dict:
+                 new_embeddings: dict[str, list[float]], model: str) -> dict:
     executed = {"add": 0, "update": 0, "delete": 0}
     crash_after = int(os.environ.get("RECONCILE_CRASH_AFTER_BILLS", "0"))
     done_bills = 0
+    total = len(plan["replace"])
     with conn.cursor() as cur:
         for uid in plan["delete"]:
             cur.execute(f"DELETE FROM {schema}.chunks WHERE bill_uid = %s", (uid,))
             executed["delete"] += cur.rowcount
             conn.commit()
         for uid in plan["replace"]:
+            reusable = load_bill_embeddings(cur, schema, uid)
             rows = []
             for h, chunk in desired[uid].items():
                 if h in new_embeddings:
@@ -253,6 +259,8 @@ def execute_plan(conn, schema: str, plan: dict, desired: dict[str, dict[str, dic
                 VALUES %s""", rows)
             conn.commit()
             done_bills += 1
+            if done_bills % 500 == 0:
+                log.info(f"replaced {done_bills}/{total} bills")
             if crash_after and done_bills >= crash_after:
                 log.error(f"RECONCILE_CRASH_AFTER_BILLS={crash_after}: simulating crash")
                 os._exit(1)  # drill seam: hard kill, no cleanup
@@ -373,14 +381,11 @@ def main() -> int:
             log.error(f"could not open audit row (nothing mutated): {e}")
             return 1
         try:
-            with conn.cursor() as cur:
-                reusable = load_reusable_embeddings(cur, schema, plan["replace"])
             new_chunks = {h: c for uid in plan["replace"]
                           for h, c in desired[uid].items() if h in plan["new_hashes"]}
             embeddings = embed_new(new_chunks, args.backend, args.model, args.dimensions)
 
-            executed = execute_plan(conn, schema, plan, desired, embeddings,
-                                    reusable, args.model)
+            executed = execute_plan(conn, schema, plan, desired, embeddings, args.model)
             with conn.cursor() as cur:
                 total = verify(cur, schema, congress, desired)
                 cur.execute("SELECT ops.refresh_data_versions()")
